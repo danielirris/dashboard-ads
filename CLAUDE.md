@@ -33,20 +33,39 @@ proyecto.
 ## Arquitectura / flujo de datos
 
 ```
-Facebook Ads API ──(ad_id, nombre, gasto)──┐
-                                            ├──> metrics.py ──> app.py (Streamlit)
-Supabase ──────────(ventas por ad_id)───────┘   (une por ad_id,
-                                                  calcula ROAS y CPA)
+Facebook Ads ──(ad_id, nombre, gasto, frecuencia)──────┐
+                                                        │
+Supabase                                                ├──> metrics.py ──> app.py
+  ├── compradores  (ventas por ad_id) ──────────────────┤    (cruza por
+  └── contactos    (conversaciones por primer_ad_id) ───┘     ad_id, calcula
+                                                              ROAS, CPA,
+                                                              costo/conv, %conv)
 ```
+
+Las conversaciones (mensajes iniciados en WhatsApp) vienen de la tabla `contactos`
+de Supabase, NO de Facebook (la métrica de Facebook es menos confiable).
 
 ## Modelo de datos
 
-Tabla de ventas en Supabase:
+**Tabla `compradores`** (ventas):
 
-- Tabla: `compradores`
 - `ad_id` (text)        — id del anuncio de Facebook ← clave del cruce
 - `valor` (numeric)     — monto de la venta
-- `fecha_compra`        — fecha de la venta (columna usada para filtrar por rango)
+- `fecha_compra` (timestamptz UTC) — usada para filtrar por rango
+
+**Tabla `contactos`** (origen real de las conversaciones de WhatsApp):
+
+- `primer_ad_id` (text, nullable) — ad_id que originó el contacto (a veces null)
+- `primer_contacto_at` (timestamptz UTC) — momento del primer contacto
+
+Toda agrupación o cruce por fecha se hace en **día calendario de Bogotá**
+(`America/Bogota`): los timestamps UTC se convierten con `.dt.tz_convert(BOGOTA)`
+antes de tomar el día. NO usar `tz_localize(None)` — eso solo borra la zona sin
+convertir y mete las ventas/contactos nocturnos en el día equivocado.
+
+Los contactos con `primer_ad_id` nulo se agrupan aparte en una fila
+`"Sin anuncio (no atribuido)"` para que los totales reconcilien
+(total = atribuidas + sin atribuir).
 
 ## Estructura del proyecto
 
@@ -59,10 +78,10 @@ Tabla de ventas en Supabase:
 ├── .env.example         # plantilla de variables (sin valores reales)
 ├── requirements.txt
 ├── src/
-│   ├── facebook_client.py   # trae gasto + nombre por ad_id (Fase 1)
-│   ├── supabase_client.py   # lee ventas (Fase 1)
-│   └── metrics.py           # une por ad_id y calcula ROAS/CPA (Fase 2)
-└── app.py                   # dashboard Streamlit (Fase 3)
+│   ├── facebook_client.py   # gasto, frecuencia, nombre por ad_id (FB API)
+│   ├── supabase_client.py   # ventas (compradores) + contactos (Supabase)
+│   └── metrics.py           # cruza por ad_id y calcula métricas
+└── app.py                   # dashboard Streamlit
 ```
 
 ## Múltiples cuentas y moneda
@@ -86,6 +105,7 @@ USD_TO_COP=4000                                 # tasa USD→COP para cuentas no
 SUPABASE_URL=
 SUPABASE_KEY=
 SALES_TABLE=compradores
+CONTACTS_TABLE=contactos
 ```
 
 ## Comandos

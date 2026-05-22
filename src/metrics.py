@@ -1,7 +1,18 @@
 """Cruce de Facebook Ads + Supabase por `ad_id`. El corazón del proyecto.
 
-Une el gasto por anuncio (Facebook, ya en COP) con las ventas (Supabase) y calcula,
-por anuncio, número de ventas, monto, ROAS (ventas / gasto) y CPA (gasto / ventas).
+Tres fuentes:
+- Facebook (`get_ad_spend`, `get_daily_spend`): gasto + frecuencia por anuncio.
+- Supabase `compradores` (`get_sales`): ventas.
+- Supabase `contactos` (`get_contactos`): conversaciones REALES de WhatsApp.
+
+Las conversaciones SIEMPRE vienen de la tabla `contactos` (más confiables que
+las que reporta Facebook). La frecuencia sí viene de Facebook.
+
+Métricas calculadas por anuncio:
+- ROAS                   = monto_ventas / gasto
+- CPA / costo por venta  = gasto / n_ventas
+- costo por conversación = gasto / conversaciones
+- tasa de conversión (%) = 100 · n_ventas / conversaciones
 """
 
 from __future__ import annotations
@@ -16,32 +27,76 @@ import pandas as pd
 # Permite ejecutar `python src/metrics.py` desde la raíz del proyecto.
 sys.path.insert(0, str(Path(__file__).parent))
 
-from facebook_client import get_ad_spend  # noqa: E402
-from supabase_client import get_sales  # noqa: E402
+from facebook_client import get_ad_spend, get_daily_spend  # noqa: E402
+from supabase_client import get_contactos, get_sales  # noqa: E402
 
 SIN_NOMBRE = "(sin datos en Facebook)"
+NO_AD_LABEL = "Sin anuncio (no atribuido)"
+# Sentinela usada como ad_id para la fila de contactos sin `primer_ad_id`.
+# Empieza por "_" para no chocar con ningún ad_id real de Facebook.
+NO_AD_SENTINEL = "_sin_anuncio_"
+
+# Cualquier agrupación o cruce por fecha se hace en día calendario de Bogotá.
+BOGOTA = "America/Bogota"
+
+
+def _conversaciones_por_ad(contactos_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Cuenta contactos por `primer_ad_id`. Devuelve (df_por_ad, n_sin_atribuir).
+
+    `df_por_ad` tiene columnas: ad_id (string), conversaciones (int). Solo
+    incluye contactos CON `primer_ad_id`. `n_sin_atribuir` es el conteo de
+    contactos con `primer_ad_id` nulo.
+    """
+    if contactos_df.empty:
+        return pd.DataFrame(columns=["ad_id", "conversaciones"]), 0
+
+    sin_atribuir = int(contactos_df["primer_ad_id"].isna().sum())
+    atribuidos = contactos_df.dropna(subset=["primer_ad_id"]).copy()
+    if atribuidos.empty:
+        return pd.DataFrame(columns=["ad_id", "conversaciones"]), sin_atribuir
+
+    atribuidos["ad_id"] = atribuidos["primer_ad_id"].astype(str)
+    agg = (
+        atribuidos.groupby("ad_id", as_index=False)
+        .size()
+        .rename(columns={"size": "conversaciones"})
+    )
+    return agg, sin_atribuir
 
 
 def get_ad_performance(since: str, until: str) -> pd.DataFrame:
-    """Devuelve un DataFrame por anuncio con gasto, ventas, ROAS y CPA.
+    """Devuelve un DataFrame por anuncio con todas las métricas del embudo.
 
-    Columnas: ad_id, ad_name, gasto, n_ventas, monto_ventas, roas, cpa.
-    Ordenado por monto_ventas descendente.
+    Columnas (en este orden):
+      ad_id, ad_name, gasto, frequency, conversaciones, n_ventas, monto_ventas,
+      costo_por_conversacion, cpa, tasa_conversion, roas
+    Ordenado por monto_ventas descendente, con una fila final extra
+    `"Sin anuncio (no atribuido)"` cuando hay contactos con `primer_ad_id` nulo
+    (para que las conversaciones de la tabla reconcilien con el total).
 
-    Casos borde:
-    - Anuncios con gasto pero sin ventas: n_ventas = 0, monto_ventas = 0, roas = 0,
-      cpa = NaN (no se divide entre cero).
-    - Ventas cuyo ad_id no está en Facebook: gasto = 0, ad_name marcado como
-      "(sin datos en Facebook)", roas = NaN, cpa = 0.
+    Fuentes (CADA columna sabe de dónde viene):
+    - gasto, frequency       → Facebook
+    - n_ventas, monto_ventas → Supabase `compradores`
+    - conversaciones         → Supabase `contactos`  (NO Facebook)
+
+    Casos borde (evitamos divisiones por cero):
+    - Sin conversaciones: costo_por_conversacion = NaN, tasa_conversion = NaN.
+    - Sin ventas: cpa = NaN.
+    - Sin gasto: roas = NaN.
+    - Ventas con ad_id que no está en Facebook: ad_name = "(sin datos en Facebook)".
     """
     spend_df = get_ad_spend(since, until).copy()
     sales_df = get_sales(since, until)
+    contactos_df = get_contactos(since, until)
 
-    # Normalizamos ad_id a string en ambos lados antes del merge.
+    # Normalizamos ad_id a string en spend_df, renombramos `spend` y nos
+    # quedamos solo con las columnas que aporta Facebook (descartamos su
+    # estimación de conversaciones; las verdaderas vienen de `contactos`).
     spend_df["ad_id"] = spend_df["ad_id"].astype(str)
     spend_df = spend_df.rename(columns={"spend": "gasto"})
+    spend_df = spend_df[["ad_id", "ad_name", "gasto", "frequency"]]
 
-    # Agrupamos ventas por ad_id (ignorando filas sin ad_id).
+    # Ventas agrupadas por ad_id (ignorando filas sin ad_id).
     if sales_df.empty:
         sales_agg = pd.DataFrame(columns=["ad_id", "n_ventas", "monto_ventas"])
     else:
@@ -52,15 +107,49 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
             monto_ventas=("valor", "sum"),
         )
 
-    # Outer merge → incluimos anuncios con gasto sin ventas y ventas sin gasto.
-    merged = spend_df.merge(sales_agg, on="ad_id", how="outer")
+    # Conversaciones (solo las atribuidas a un ad_id).
+    contactos_agg, n_sin_atribuir = _conversaciones_por_ad(contactos_df)
+
+    # Outer merge de las tres fuentes por ad_id.
+    merged = (
+        spend_df.merge(sales_agg, on="ad_id", how="outer")
+        .merge(contactos_agg, on="ad_id", how="outer")
+    )
 
     merged["gasto"] = merged["gasto"].fillna(0.0)
+    merged["frequency"] = merged["frequency"].fillna(0.0)
+    merged["conversaciones"] = merged["conversaciones"].fillna(0).astype(int)
     merged["n_ventas"] = merged["n_ventas"].fillna(0).astype(int)
     merged["monto_ventas"] = merged["monto_ventas"].fillna(0.0)
     merged["ad_name"] = merged["ad_name"].fillna(SIN_NOMBRE)
 
-    # ROAS y CPA evitando divisiones por cero.
+    merged = merged.sort_values("monto_ventas", ascending=False, ignore_index=True)
+
+    # Fila extra para los contactos sin `primer_ad_id`. Va al final, fuera del
+    # ordenamiento normal, para que totales reconcilien:
+    #   total_conversaciones_dashboard = atribuidas + sin_atribuir
+    if n_sin_atribuir > 0:
+        merged = pd.concat(
+            [
+                merged,
+                pd.DataFrame(
+                    [
+                        {
+                            "ad_id": NO_AD_SENTINEL,
+                            "ad_name": NO_AD_LABEL,
+                            "gasto": 0.0,
+                            "frequency": 0.0,
+                            "conversaciones": n_sin_atribuir,
+                            "n_ventas": 0,
+                            "monto_ventas": 0.0,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+
+    # Métricas derivadas — todas evitan dividir por cero.
     merged["roas"] = np.where(
         merged["gasto"] > 0,
         merged["monto_ventas"] / merged["gasto"].replace(0, np.nan),
@@ -71,11 +160,104 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
         merged["gasto"] / merged["n_ventas"].replace(0, np.nan),
         np.nan,
     )
+    merged["costo_por_conversacion"] = np.where(
+        merged["conversaciones"] > 0,
+        merged["gasto"] / merged["conversaciones"].replace(0, np.nan),
+        np.nan,
+    )
+    merged["tasa_conversion"] = np.where(
+        merged["conversaciones"] > 0,
+        100.0 * merged["n_ventas"] / merged["conversaciones"].replace(0, np.nan),
+        np.nan,
+    )
 
-    merged = merged.sort_values("monto_ventas", ascending=False, ignore_index=True)
     return merged[
-        ["ad_id", "ad_name", "gasto", "n_ventas", "monto_ventas", "roas", "cpa"]
+        [
+            "ad_id",
+            "ad_name",
+            "gasto",
+            "frequency",
+            "conversaciones",
+            "n_ventas",
+            "monto_ventas",
+            "costo_por_conversacion",
+            "cpa",
+            "tasa_conversion",
+            "roas",
+        ]
     ]
+
+
+def get_daily_totals(since: str, until: str) -> pd.DataFrame:
+    """Totales diarios agrupados por día de Bogotá.
+
+    Devuelve un DataFrame con una fila por día del rango y columnas:
+    `date`, `gasto`, `monto_ventas`, `conversaciones`.
+
+    - `gasto` viene de Facebook (en COP).
+    - `monto_ventas` viene de `compradores`.
+    - `conversaciones` viene de `contactos` y cuenta **TODOS los contactos**
+      del día (incluidos los que tienen `primer_ad_id` nulo), agrupados por
+      `primer_contacto_at` convertido a día de Bogotá.
+
+    Incluye los días sin actividad (con ceros) para que la gráfica no salte
+    huecos. NO se usa `tz_localize(None)`; UTC se convierte explícitamente
+    a Bogotá antes de tomar el día.
+    """
+    spend = get_daily_spend(since, until).rename(columns={"spend": "gasto"})
+    sales_df = get_sales(since, until)
+    contactos_df = get_contactos(since, until)
+
+    # Ventas por día de Bogotá.
+    if not sales_df.empty:
+        sales_df = sales_df.copy()
+        sales_df["date"] = (
+            pd.to_datetime(sales_df["fecha_compra"], utc=True)
+            .dt.tz_convert(BOGOTA)
+            .dt.date
+        )
+        sales = (
+            sales_df.groupby("date", as_index=False)["valor"]
+            .sum()
+            .rename(columns={"valor": "monto_ventas"})
+        )
+    else:
+        sales = pd.DataFrame(columns=["date", "monto_ventas"])
+
+    # Conversaciones por día de Bogotá → TODOS los contactos (con y sin ad_id).
+    if not contactos_df.empty:
+        contactos_df = contactos_df.copy()
+        contactos_df["date"] = (
+            pd.to_datetime(contactos_df["primer_contacto_at"], utc=True)
+            .dt.tz_convert(BOGOTA)
+            .dt.date
+        )
+        contactos_daily = (
+            contactos_df.groupby("date", as_index=False)
+            .size()
+            .rename(columns={"size": "conversaciones"})
+        )
+    else:
+        contactos_daily = pd.DataFrame(columns=["date", "conversaciones"])
+
+    if not spend.empty:
+        # Facebook ya entrega `date_start` como "YYYY-MM-DD" (día sin hora).
+        spend["date"] = pd.to_datetime(spend["date"]).dt.date
+
+    # Esqueleto con todos los días del rango como objetos `date`.
+    all_days = pd.DataFrame(
+        {"date": [d.date() for d in pd.date_range(since, until, freq="D")]}
+    )
+
+    merged = (
+        all_days.merge(spend, on="date", how="left")
+        .merge(sales, on="date", how="left")
+        .merge(contactos_daily, on="date", how="left")
+    )
+    merged["gasto"] = merged["gasto"].fillna(0.0)
+    merged["monto_ventas"] = merged["monto_ventas"].fillna(0.0)
+    merged["conversaciones"] = merged["conversaciones"].fillna(0).astype(int)
+    return merged.sort_values("date", ignore_index=True)
 
 
 if __name__ == "__main__":
@@ -103,15 +285,27 @@ if __name__ == "__main__":
     gasto_total = df["gasto"].sum()
     ventas_total = df["monto_ventas"].sum()
     n_ventas_total = int(df["n_ventas"].sum())
+    conv_total = int(df["conversaciones"].sum())
+    conv_atribuidas = int(
+        df.loc[df["ad_id"] != NO_AD_SENTINEL, "conversaciones"].sum()
+    )
+    conv_sin_atribuir = int(
+        df.loc[df["ad_id"] == NO_AD_SENTINEL, "conversaciones"].sum()
+    )
 
     print(f"\nGasto total:        {gasto_total:,.2f} COP")
     print(f"Monto ventas total: {ventas_total:,.2f} COP")
+    print(f"Conversaciones:     {conv_total}  "
+          f"(atribuidas: {conv_atribuidas}  ·  sin atribuir: {conv_sin_atribuir})")
     print(f"Ventas totales:     {n_ventas_total}")
 
     if gasto_total > 0:
         print(f"ROAS global:        {ventas_total / gasto_total:.2f}")
     if n_ventas_total > 0:
         print(f"CPA global:         {gasto_total / n_ventas_total:,.2f} COP")
+    if conv_total > 0:
+        print(f"Costo/conversación: {gasto_total / conv_total:,.2f} COP")
+        print(f"Tasa conv global:   {100 * n_ventas_total / conv_total:.1f}%")
 
     print("\n" + "=" * 80)
     print("Top anuncios por monto de ventas:")
