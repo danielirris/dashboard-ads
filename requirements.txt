@@ -4,3 +4,4 @@ facebook-business
 supabase
 python-dotenv
 plotly
+openai

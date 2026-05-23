@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Config del negocio (personal de cada instalación; se genera en el primer arranque)
+config.json
+
 # Entorno virtual de Python
 venv/
 .venv/

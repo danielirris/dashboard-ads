@@ -98,15 +98,63 @@ no estén en COP se convierten multiplicando su gasto por `USD_TO_COP` (tasa con
 
 ```
 FB_ACCESS_TOKEN=
-FB_AD_ACCOUNT_ID=act_XXXXXXXXX,act_YYYYYYYYY   # una o varias, separadas por coma
 FB_APP_ID=
 FB_APP_SECRET=
-USD_TO_COP=4000                                 # tasa USD→COP para cuentas no-COP
+
+# Cuentas: vacío → auto-discovery (todas las del token vía /me/adaccounts).
+# Definida → filtro a esas cuentas. Lista separada por coma.
+FB_AD_ACCOUNT_ID=
+
+# Tasas a COP. Una variable <MONEDA>_TO_COP por cada moneda usada.
+USD_TO_COP=4000
+MXN_TO_COP=200
+
 SUPABASE_URL=
 SUPABASE_KEY=
 SALES_TABLE=compradores
 CONTACTS_TABLE=contactos
+
+# Asistente IA (OpenAI). Si está vacío, el chat aparece deshabilitado.
+OPENAI_API_KEY=
 ```
+
+## Parámetros del negocio (config.json, NO .env)
+
+Los umbrales del semáforo (CPA, ROAS), el margen y la meta diaria de ganancia
+viven en `config.json` en la raíz, gestionados desde el panel
+"⚙️ Configuración del negocio" del dashboard (sidebar).
+
+Estructura de `config.json`:
+
+```
+{
+  "margen_porcentaje": 0.30,
+  "cpa_bueno": 80000,
+  "cpa_maximo": 120000,
+  "roas_minimo": 2.0,
+  "roas_bueno": 3.0,
+  "meta_ganancia_diaria": 100000
+}
+```
+
+- Lo lee `src/config.py` (`load_config`, `save_config`, `get_config`).
+- Si no existe, se crea en el primer arranque: bootstrap desde el `.env`
+  (compatibilidad con la versión previa) o desde defaults razonables.
+- Está en `.gitignore` (config personal, no se versiona).
+- Las **claves y tokens** siguen en `.env` (`OPENAI_API_KEY`, `FB_*`,
+  `SUPABASE_KEY`, etc.); NUNCA se exponen en la UI.
+
+## Semáforo de CPA y ROAS
+
+El dashboard pinta CPA y ROAS en **verde/amarillo/rojo** según los umbrales
+del `.env`. Se aplica en varios niveles: tabla por cuenta, por campaña, por
+anuncio y en el panel de detalle (tarjetas grandes).
+
+- CPA: `CPA_BUENO` y `CPA_MAXIMO` (`≤ BUENO` 🟢, `≤ MAXIMO` 🟡, `>` 🔴).
+- ROAS: `ROAS_MINIMO` y `ROAS_BUENO` (`< MINIMO` 🔴, `< BUENO` 🟡, `≥ BUENO` 🟢).
+
+La lógica vive en `metrics.cpa_status()` y `metrics.roas_status()`. Si los
+umbrales no están definidos en el `.env`, el semáforo queda en gris ("sin datos").
 
 ## Comandos
 
