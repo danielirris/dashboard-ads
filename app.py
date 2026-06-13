@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -22,12 +23,16 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import get_config, save_config  # noqa: E402
+from facebook_client import sync_ads_to_supabase  # noqa: E402
 from metrics import (  # noqa: E402
     NO_ACCOUNT_LABEL,
+    NO_CAMPAIGN_LABEL,
+    NO_CAMPAIGN_SENTINEL,
+    NO_ACCOUNT_SENTINEL,
+    SIN_NOMBRE,
+    aggregate_by,
     cpa_status,
-    get_account_performance,
     get_ad_performance,
-    get_campaign_performance,
     get_daily_totals,
     roas_status,
 )
@@ -57,6 +62,9 @@ st.set_page_config(
 
 CACHE_TTL = 600  # 10 minutos
 
+# Todas las fechas visibles se calculan en día calendario de Bogotá (UTC-5).
+BOGOTA = ZoneInfo("America/Bogota")
+
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando rendimiento por anuncio…")
 def load_performance(since: str, until: str) -> pd.DataFrame:
@@ -64,18 +72,16 @@ def load_performance(since: str, until: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando evolución diaria…")
-def load_daily(since: str, until: str) -> pd.DataFrame:
-    return get_daily_totals(since, until)
+def load_daily(
+    since: str,
+    until: str,
+    ad_ids: tuple[str, ...] | None = None,
+    pais: str | None = None,
+) -> pd.DataFrame:
+    return get_daily_totals(
+        since, until, set(ad_ids) if ad_ids else None, pais
+    )
 
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando rendimiento por campaña…")
-def load_campaigns(since: str, until: str) -> pd.DataFrame:
-    return get_campaign_performance(since, until)
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando rendimiento por cuenta…")
-def load_accounts(since: str, until: str) -> pd.DataFrame:
-    return get_account_performance(since, until)
 
 
 def fmt_cop(value: float) -> str:
@@ -214,8 +220,6 @@ def _fmt_num_llm(v) -> str:
 
 def build_data_context(
     df: pd.DataFrame,
-    campaigns: pd.DataFrame,
-    accounts: pd.DataFrame,
     daily: pd.DataFrame,
     since: str,
     until: str,
@@ -248,6 +252,16 @@ def build_data_context(
     lines.append("")
 
     # ── Cuentas ─────────────────────────────────────────────────────────────
+    ad_df = df.copy()
+    ad_df["account_id"] = ad_df["account_id"].fillna(NO_ACCOUNT_SENTINEL)
+    ad_df["account_name"] = ad_df["account_name"].fillna(NO_ACCOUNT_LABEL)
+    accounts = aggregate_by(ad_df, ["account_id", "account_name"])
+
+    ad_df2 = df.copy()
+    ad_df2["campaign_id"] = ad_df2["campaign_id"].fillna(NO_CAMPAIGN_SENTINEL)
+    ad_df2["campaign_name"] = ad_df2["campaign_name"].fillna(NO_CAMPAIGN_LABEL)
+    campaigns = aggregate_by(ad_df2, ["campaign_id", "campaign_name"])
+
     lines.append("## Por cuenta publicitaria")
     if accounts.empty:
         lines.append("(sin datos)")
@@ -378,7 +392,7 @@ def render_ad_detail(ad: pd.Series) -> None:
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Gasto", fmt_cop(float(ad["gasto"])))
-    m2.metric("Ventas (monto)", fmt_cop(float(ad["monto_ventas"])))
+    m2.metric("Ventas (COP)", fmt_cop(float(ad["monto_ventas"])))
     m3.metric("Conversaciones", f"{int(ad['conversaciones']):,}")
     m4.metric("Tasa Conv → Venta", _fmt_pct_or_dash(ad["tasa_conversion"]))
     m5.metric(
@@ -394,7 +408,8 @@ def render_ad_detail(ad: pd.Series) -> None:
 
 st.sidebar.title("Filtros")
 
-today = date.today()
+# "Hoy" en Bogotá, no en la timezone del servidor (que puede ser UTC).
+today = datetime.now(BOGOTA).date()
 default_since = today - timedelta(days=7)
 
 date_range = st.sidebar.date_input(
@@ -421,6 +436,20 @@ st.sidebar.caption(f"Periodo: **{since}** → **{until}**")
 if st.sidebar.button("🔄 Refrescar datos"):
     st.cache_data.clear()
     st.rerun()
+
+if st.sidebar.button("📥 Sincronizar anuncios con Facebook"):
+    with st.spinner("Sincronizando anuncios con Supabase…"):
+        sync_result = sync_ads_to_supabase(since, until)
+    if sync_result["errors"]:
+        for _err in sync_result["errors"]:
+            st.sidebar.error(f"❌ {_err}")
+    else:
+        _already = sync_result["requested"] - sync_result["new"]
+        st.sidebar.success(
+            f"✅ {sync_result['new']} anuncios nuevos insertados.\n\n"
+            f"({sync_result['requested']} en el rango; "
+            f"{_already} ya existían y no se tocaron.)"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -512,155 +541,108 @@ with st.sidebar.expander("⚙️ Configuración del negocio", expanded=False):
 
 df = load_performance(since, until)
 daily = load_daily(since, until)
-campaigns = load_campaigns(since, until)
-accounts = load_accounts(since, until)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Header + KPIs
+# Header
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.title("Dashboard de Rentabilidad por Anuncio")
-st.caption(f"Periodo: **{since}** → **{until}** · Pesos colombianos (COP)")
-
-gasto_total = float(df["gasto"].sum())
-monto_ventas_total = float(df["monto_ventas"].sum())
-n_ventas_total = int(df["n_ventas"].sum())
-conv_total = int(df["conversaciones"].sum())
-roas_global = monto_ventas_total / gasto_total if gasto_total > 0 else None
-cpa_global = gasto_total / n_ventas_total if n_ventas_total > 0 else None
-cost_per_conv_global = gasto_total / conv_total if conv_total > 0 else None
-tasa_conv_global = (100 * n_ventas_total / conv_total) if conv_total > 0 else None
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Gasto total", fmt_cop(gasto_total))
-col2.metric("Ventas totales", fmt_cop(monto_ventas_total))
-col3.metric(
-    "ROAS global",
-    f"{roas_global:.2f}" if roas_global is not None else "—",
-    help="Monto de ventas ÷ Gasto. >1 significa que ingresas más de lo que inviertes.",
-)
-col4.metric(
-    "Nº ventas (CPA)",
-    f"{n_ventas_total}",
-    delta=fmt_cop(cpa_global) if cpa_global is not None else None,
-    delta_color="off",
-    help="Total de ventas. Debajo, el CPA global (costo por venta).",
-)
-
-# Segunda fila: métricas de embudo / mensajería + ganancia.
-ganancia_total = monto_ventas_total - gasto_total
-
-col5, col6, col7, col8 = st.columns(4)
-col5.metric(
-    "Conversaciones",
-    f"{conv_total:,}",
-    help=(
-        "Total de contactos de WhatsApp en el rango (tabla `contactos` de "
-        "Supabase). Incluye los no atribuidos a un anuncio — esos aparecen en "
-        "la tabla como 'Sin anuncio (no atribuido)' para que los totales "
-        "reconcilien."
-    ),
-)
-col6.metric(
-    "Costo / conversación",
-    fmt_cop(cost_per_conv_global) if cost_per_conv_global is not None else "—",
-    help="Gasto ÷ Conversaciones.",
-)
-col7.metric(
-    "Tasa Conv → Venta",
-    f"{tasa_conv_global:.1f}%" if tasa_conv_global is not None else "—",
-    help="Nº ventas ÷ Conversaciones × 100. Eficiencia del speech de venta.",
-)
-col8.metric(
-    "Ganancia",
-    fmt_cop(ganancia_total),
-    help="Ventas − Gasto.",
-)
-
-st.divider()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Evolución diaria
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Gasto y ventas por día")
-
-if daily.empty or (daily["gasto"].sum() == 0 and daily["monto_ventas"].sum() == 0):
-    st.info("Sin gasto ni ventas en el rango seleccionado.")
-else:
-    daily_long = daily.melt(
-        id_vars="date",
-        value_vars=["gasto", "monto_ventas"],
-        var_name="serie",
-        value_name="valor",
-    )
-    nombres = {"gasto": "Gasto", "monto_ventas": "Ventas"}
-    daily_long["serie"] = daily_long["serie"].map(nombres)
-
-    fig_daily = px.line(
-        daily_long,
-        x="date",
-        y="valor",
-        color="serie",
-        markers=True,
-        labels={"date": "Día", "valor": "COP", "serie": ""},
-        color_discrete_map={"Gasto": "#EF553B", "Ventas": "#00CC96"},
-    )
-    fig_daily.update_layout(
-        legend_title_text="",
-        hovermode="x unified",
-        yaxis_tickformat=",.0f",
-    )
-    fig_daily.update_traces(hovertemplate="$%{y:,.0f} COP")
-    st.plotly_chart(fig_daily, use_container_width=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Conversaciones por día (tabla contactos: TODAS, atribuidas o no)
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Conversaciones por día")
 st.caption(
-    "Total de contactos por día de Bogotá (tabla `contactos` de Supabase). "
-    "Cuenta todos los contactos, incluso los que llegaron sin `primer_ad_id`."
+    f"Periodo: **{since}** → **{until}** · "
+    f"Todos los valores convertidos a COP"
 )
-
-if daily.empty or daily["conversaciones"].sum() == 0:
-    st.info("Sin conversaciones en el rango.")
-else:
-    fig_conv = px.bar(
-        daily,
-        x="date",
-        y="conversaciones",
-        labels={"date": "Día", "conversaciones": "Conversaciones"},
-        color_discrete_sequence=["#636EFA"],
-    )
-    fig_conv.update_layout(
-        hovermode="x unified",
-        yaxis_tickformat=",.0f",
-    )
-    fig_conv.update_traces(hovertemplate="%{y:,} conversaciones")
-    st.plotly_chart(fig_conv, use_container_width=True)
-
-st.divider()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rendimiento por CUENTA PUBLICITARIA (con semáforo CPA + ROAS)
+# Helpers para renderizar secciones reutilizables por país
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.subheader("Rendimiento por cuenta publicitaria")
-st.caption(
-    "Vista agregada por cuenta de Facebook Ads. "
-    "Las celdas de CPA y ROAS se pintan según los umbrales del `.env`.  "
-    + thresholds_caption()
-)
+_PAISES_ORDEN = [
+    "Colombia", "Perú", "Chile", "México", "Venezuela", "Costa Rica", "Ecuador",
+]
 
-if accounts.empty:
-    st.info("Sin datos de cuentas en el rango.")
-else:
+_PAIS_BANDERAS = {
+    "Colombia": "🇨🇴",
+    "Perú": "🇵🇪",
+    "Chile": "🇨🇱",
+    "México": "🇲🇽",
+    "Venezuela": "🇻🇪",
+    "Costa Rica": "🇨🇷",
+    "Ecuador": "🇪🇨",
+}
+
+
+def _estado_badge(estado: str, ad_name: str) -> str:
+    if ad_name == SIN_NOMBRE:
+        return "⚠️ Sin datos"
+    return {
+        "prendido": "🟢 Prendido",
+        "apagado": "🔴 Apagado",
+        "otro": "⚫ Otro",
+    }.get(estado, "⚫ Otro")
+
+
+def _render_kpis(df_country: pd.DataFrame, conv_total: int) -> None:
+    """Renderiza las 2 filas de KPIs a partir de un DataFrame de anuncios.
+
+    `conv_total` es el conteo de conversaciones del país (de `contactos`
+    filtrado por su columna `pais`), que se pasa explícito para que el KPI y
+    el gráfico de conversaciones por día sean consistentes — y NO dependan de
+    la atribución por ad_id.
+    """
+    gasto_total = float(df_country["gasto"].sum())
+    monto_ventas_total = float(df_country["monto_ventas"].sum())
+    n_ventas_total = int(df_country["n_ventas"].sum())
+    roas_global = monto_ventas_total / gasto_total if gasto_total > 0 else None
+    cpa_global = gasto_total / n_ventas_total if n_ventas_total > 0 else None
+    cost_per_conv = gasto_total / conv_total if conv_total > 0 else None
+    tasa_conv = (100 * n_ventas_total / conv_total) if conv_total > 0 else None
+    ganancia_total = monto_ventas_total - gasto_total
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Gasto total", fmt_cop(gasto_total))
+    col2.metric("Ventas totales (COP)", fmt_cop(monto_ventas_total))
+    col3.metric(
+        "ROAS global",
+        f"{roas_global:.2f}" if roas_global is not None else "—",
+        help="Monto de ventas ÷ Gasto.",
+    )
+    col4.metric(
+        "Nº ventas (CPA)",
+        f"{n_ventas_total}",
+        delta=fmt_cop(cpa_global) if cpa_global is not None else None,
+        delta_color="off",
+        help="Total de ventas. Debajo, el CPA global (costo por venta).",
+    )
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Conversaciones", f"{conv_total:,}")
+    col6.metric(
+        "Costo / conversación",
+        fmt_cop(cost_per_conv) if cost_per_conv is not None else "—",
+    )
+    col7.metric(
+        "Tasa Conv → Venta",
+        f"{tasa_conv:.1f}%" if tasa_conv is not None else "—",
+    )
+    col8.metric("Ganancia", fmt_cop(ganancia_total), help="Ventas − Gasto.")
+
+
+def _render_accounts_table(df_country: pd.DataFrame) -> None:
+    """Tabla de rendimiento por cuenta derivada del DataFrame filtrado."""
+    ad_df = df_country.copy()
+    ad_df["account_id"] = ad_df["account_id"].fillna(NO_ACCOUNT_SENTINEL)
+    ad_df["account_name"] = ad_df["account_name"].fillna(NO_ACCOUNT_LABEL)
+    accounts = aggregate_by(ad_df, ["account_id", "account_name"])
+
+    st.subheader("Rendimiento por cuenta publicitaria")
+    st.caption(thresholds_caption())
+
+    if accounts.empty:
+        st.info("Sin datos de cuentas.")
+        return
+
     acc_display = accounts.rename(
         columns={
             "account_name": "Cuenta",
@@ -668,7 +650,7 @@ else:
             "gasto": "Gasto",
             "conversaciones": "Conv.",
             "n_ventas": "Ventas",
-            "monto_ventas": "Monto ventas",
+            "monto_ventas": "Ventas (COP)",
             "utilidad": "Utilidad",
             "costo_por_conversacion": "Costo/Conv.",
             "cpa": "CPA",
@@ -677,21 +659,12 @@ else:
         }
     )[
         [
-            "Cuenta",
-            "Anuncios",
-            "Gasto",
-            "Conv.",
-            "Ventas",
-            "Monto ventas",
-            "Utilidad",
-            "Costo/Conv.",
-            "CPA",
-            "% Conv→Venta",
-            "ROAS",
+            "Cuenta", "Anuncios", "Gasto", "Conv.", "Ventas",
+            "Ventas (COP)", "Utilidad", "Costo/Conv.", "CPA",
+            "% Conv→Venta", "ROAS",
         ]
     ]
-
-    styled_accounts = (
+    styled = (
         acc_display.style
         .map(_cpa_cell_style, subset=["CPA"])
         .map(_roas_cell_style, subset=["ROAS"])
@@ -701,7 +674,7 @@ else:
                 "Gasto": _fmt_money_or_dash,
                 "Conv.": "{:,.0f}",
                 "Ventas": "{:,.0f}",
-                "Monto ventas": _fmt_money_or_dash,
+                "Ventas (COP)": _fmt_money_or_dash,
                 "Utilidad": _fmt_money_or_dash,
                 "Costo/Conv.": _fmt_money_or_dash,
                 "CPA": _fmt_money_or_dash,
@@ -710,24 +683,23 @@ else:
             }
         )
     )
-    st.dataframe(styled_accounts, use_container_width=True, hide_index=True)
-
-st.divider()
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Rendimiento por CAMPAÑA (con semáforo CPA + ROAS)
-# ──────────────────────────────────────────────────────────────────────────────
+def _render_campaigns_table(df_country: pd.DataFrame) -> None:
+    """Tabla de rendimiento por campaña derivada del DataFrame filtrado."""
+    ad_df = df_country.copy()
+    ad_df["campaign_id"] = ad_df["campaign_id"].fillna(NO_CAMPAIGN_SENTINEL)
+    ad_df["campaign_name"] = ad_df["campaign_name"].fillna(NO_CAMPAIGN_LABEL)
+    campaigns = aggregate_by(ad_df, ["campaign_id", "campaign_name"])
 
-st.subheader("Rendimiento por campaña")
-st.caption(
-    "Vista agregada. Las celdas de CPA y ROAS se pintan según los umbrales del "
-    "`.env`.  " + thresholds_caption()
-)
+    st.subheader("Rendimiento por campaña")
+    st.caption(thresholds_caption())
 
-if campaigns.empty:
-    st.info("Sin datos de campañas en el rango.")
-else:
+    if campaigns.empty:
+        st.info("Sin datos de campañas.")
+        return
+
     camp_display = campaigns.rename(
         columns={
             "campaign_name": "Campaña",
@@ -735,7 +707,7 @@ else:
             "gasto": "Gasto",
             "conversaciones": "Conv.",
             "n_ventas": "Ventas",
-            "monto_ventas": "Monto ventas",
+            "monto_ventas": "Ventas (COP)",
             "utilidad": "Utilidad",
             "costo_por_conversacion": "Costo/Conv.",
             "cpa": "CPA",
@@ -744,21 +716,12 @@ else:
         }
     )[
         [
-            "Campaña",
-            "Anuncios",
-            "Gasto",
-            "Conv.",
-            "Ventas",
-            "Monto ventas",
-            "Utilidad",
-            "Costo/Conv.",
-            "CPA",
-            "% Conv→Venta",
-            "ROAS",
+            "Campaña", "Anuncios", "Gasto", "Conv.", "Ventas",
+            "Ventas (COP)", "Utilidad", "Costo/Conv.", "CPA",
+            "% Conv→Venta", "ROAS",
         ]
     ]
-
-    styled_campaigns = (
+    styled = (
         camp_display.style
         .map(_cpa_cell_style, subset=["CPA"])
         .map(_roas_cell_style, subset=["ROAS"])
@@ -768,7 +731,7 @@ else:
                 "Gasto": _fmt_money_or_dash,
                 "Conv.": "{:,.0f}",
                 "Ventas": "{:,.0f}",
-                "Monto ventas": _fmt_money_or_dash,
+                "Ventas (COP)": _fmt_money_or_dash,
                 "Utilidad": _fmt_money_or_dash,
                 "Costo/Conv.": _fmt_money_or_dash,
                 "CPA": _fmt_money_or_dash,
@@ -777,32 +740,25 @@ else:
             }
         )
     )
-    st.dataframe(styled_campaigns, use_container_width=True, hide_index=True)
-
-st.divider()
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Rendimiento por anuncio — filtros + detalle del seleccionado arriba + tabla
-# ──────────────────────────────────────────────────────────────────────────────
+def _render_anuncios_section(df_country: pd.DataFrame, key_suffix: str) -> None:
+    """Sección de rendimiento por anuncio: filtros, tabla con badge, detalle."""
+    st.subheader("Rendimiento por anuncio")
+    st.caption(
+        "Filtra por cuenta o busca por nombre. Haz clic en una fila para ver "
+        "su semáforo.  " + thresholds_caption()
+    )
 
-st.subheader("Rendimiento por anuncio")
-st.caption(
-    "Filtra por cuenta o busca por nombre. Haz clic en una fila para ver su "
-    "semáforo arriba.  " + thresholds_caption()
-)
+    if df_country.empty:
+        st.info("Sin anuncios ni ventas.")
+        return
 
-# Contenedor reservado para el panel de detalle (lo llenamos después de
-# renderizar la tabla, una vez que sabemos qué fila quedó seleccionada).
-detail_container = st.container()
-
-if df.empty:
-    with detail_container:
-        st.info("Sin anuncios ni ventas en el rango.")
-else:
-    # ── Filtros ───────────────────────────────────────────────────────────────
-    account_names_present = sorted(df["account_name"].dropna().unique().tolist())
-    has_sin_cuenta = df["account_name"].isna().any()
+    account_names_present = sorted(
+        df_country["account_name"].dropna().unique().tolist()
+    )
+    has_sin_cuenta = df_country["account_name"].isna().any()
     account_options = ["Todas"] + account_names_present
     if has_sin_cuenta:
         account_options.append(NO_ACCOUNT_LABEL)
@@ -812,189 +768,334 @@ else:
         "Cuenta publicitaria",
         options=account_options,
         index=0,
-        key="ad_filter_account",
+        key=f"ad_filter_account_{key_suffix}",
     )
     search_text = f_col2.text_input(
         "Buscar anuncio por nombre",
         value="",
         placeholder="ej. CP2",
-        key="ad_filter_search",
+        key=f"ad_filter_search_{key_suffix}",
     )
 
-    # ── Aplicación de filtros ────────────────────────────────────────────────
-    filtered_df = df
+    filtered_df = df_country
     if selected_account == NO_ACCOUNT_LABEL:
         filtered_df = filtered_df[filtered_df["account_name"].isna()]
     elif selected_account != "Todas":
-        filtered_df = filtered_df[filtered_df["account_name"] == selected_account]
+        filtered_df = filtered_df[
+            filtered_df["account_name"] == selected_account
+        ]
     if search_text:
         filtered_df = filtered_df[
             filtered_df["ad_name"].str.contains(
                 search_text, case=False, na=False, regex=False
             )
         ]
-    # Reseteamos índices para que la selección por posición de la tabla mapee
-    # 1:1 a `filtered_df.iloc[idx]`.
     filtered_df = filtered_df.reset_index(drop=True)
 
-    st.caption(f"Mostrando **{len(filtered_df)}** de **{len(df)}** filas.")
-
     if filtered_df.empty:
+        st.info("Ningún anuncio coincide con los filtros actuales.")
+        return
+
+    detail_container = st.container()
+
+    estado_label = st.radio(
+        "Estado del anuncio",
+        ["Todos", "🟢 Prendidos", "🔴 Apagados", "⚠️ Sin datos FB", "Otros"],
+        horizontal=True,
+        key=f"estado_filter_{key_suffix}",
+    )
+
+    if estado_label == "🟢 Prendidos":
+        df_view = filtered_df[
+            (filtered_df["estado"] == "prendido")
+            & (filtered_df["ad_name"] != SIN_NOMBRE)
+        ]
+    elif estado_label == "🔴 Apagados":
+        df_view = filtered_df[
+            (filtered_df["estado"] == "apagado")
+            & (filtered_df["ad_name"] != SIN_NOMBRE)
+        ]
+    elif estado_label == "⚠️ Sin datos FB":
+        df_view = filtered_df[filtered_df["ad_name"] == SIN_NOMBRE]
+    elif estado_label == "Otros":
+        df_view = filtered_df[
+            (filtered_df["estado"] == "otro")
+            & (filtered_df["ad_name"] != SIN_NOMBRE)
+        ]
+    else:
+        df_view = filtered_df
+
+    df_view = df_view.copy()
+    df_view["_sin_fb"] = (df_view["ad_name"] == SIN_NOMBRE).astype(int)
+    df_view = df_view.sort_values(
+        by=["_sin_fb", "gasto", "monto_ventas"],
+        ascending=[True, False, False],
+        na_position="last",
+    ).drop(columns=["_sin_fb"]).reset_index(drop=True)
+
+    hide_no_fb = st.checkbox(
+        "Ocultar anuncios sin datos de FB",
+        value=False,
+        key=f"hide_no_fb_{key_suffix}",
+    )
+    if hide_no_fb:
+        df_view = df_view[df_view["ad_name"] != SIN_NOMBRE].reset_index(
+            drop=True
+        )
+
+    st.caption(f"Mostrando **{len(df_view)}** anuncio(s).")
+
+    if df_view.empty:
         with detail_container:
             st.info("Selecciona un anuncio de la tabla para ver su semáforo")
         st.info("Ningún anuncio coincide con los filtros actuales.")
-    else:
-        # Placeholder para la fila de 4 KPIs (Frecuencia / CPM / Visualizaciones /
-        # CTR). Se rellena tras renderizar la tabla — depende de la selección.
-        kpi_container = st.container()
+        return
 
-        # Misma forma y orden que `filtered_df`, solo sin los ids internos ni
-        # las columnas crudas de FB (impressions/reach/clicks) — esas ya las
-        # muestra la fila de KPIs.
-        table_df = filtered_df.drop(
-            columns=[
-                "ad_id",
-                "account_id",
-                "campaign_id",
-                "impressions",
-                "reach",
-                "clicks",
-            ]
-        )
+    kpi_container = st.container()
 
-        table_event = st.dataframe(
-            table_df,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="ad_table",
-            column_config={
-                "ad_name": st.column_config.TextColumn("Anuncio", width="large"),
-                "account_name": st.column_config.TextColumn("Cuenta"),
-                "campaign_name": st.column_config.TextColumn("Campaña"),
-                "gasto": st.column_config.NumberColumn("Gasto (COP)", format="$%.0f"),
-                "frequency": st.column_config.NumberColumn(
-                    "Frecuencia",
-                    format="%.2f",
-                    help="Promedio de veces que cada persona vio el anuncio.",
-                ),
-                "conversaciones": st.column_config.NumberColumn(
-                    "Conv.",
-                    format="%d",
-                    help="Conversaciones iniciadas (WhatsApp).",
-                ),
-                "n_ventas": st.column_config.NumberColumn("Nº ventas", format="%d"),
-                "monto_ventas": st.column_config.NumberColumn(
-                    "Ventas (COP)", format="$%.0f"
-                ),
-                "utilidad": st.column_config.NumberColumn(
-                    "Utilidad (COP)",
-                    format="$%.0f",
-                    help="Monto ventas − Gasto. Puede ser negativa.",
-                ),
-                "costo_por_conversacion": st.column_config.NumberColumn(
-                    "Costo/Conv. (COP)",
-                    format="$%.0f",
-                    help="Gasto ÷ Conversaciones. NaN sin conversaciones.",
-                ),
-                "cpa": st.column_config.NumberColumn(
-                    "CPA (COP)",
-                    format="$%.0f",
-                    help="Gasto ÷ Nº de ventas. NaN cuando no hay ventas.",
-                ),
-                "tasa_conversion": st.column_config.NumberColumn(
-                    "% Conv→Venta",
-                    format="%.1f%%",
-                    help="Nº ventas ÷ Conversaciones × 100. Eficiencia del speech.",
-                ),
-                "roas": st.column_config.NumberColumn(
-                    "ROAS",
-                    format="%.2f",
-                    help="Monto de ventas ÷ Gasto. NaN cuando el gasto es 0.",
-                ),
-            },
-        )
+    table_df = df_view.copy()
+    table_df.insert(
+        0,
+        "estado_badge",
+        table_df.apply(
+            lambda r: _estado_badge(r["estado"], r["ad_name"]), axis=1
+        ),
+    )
+    drop_cols = [
+        "ad_id", "account_id", "campaign_id", "impressions", "reach",
+        "clicks", "estado", "estado_raw", "pais", "pais_inconsistente",
+    ]
+    table_df = table_df.drop(
+        columns=[c for c in drop_cols if c in table_df.columns]
+    )
 
-        selected_rows = (
-            table_event.selection.rows
-            if table_event is not None and hasattr(table_event, "selection")
-            else []
-        )
+    table_event = st.dataframe(
+        table_df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"ad_table_{key_suffix}",
+        column_config={
+            "estado_badge": st.column_config.TextColumn(
+                "Estado", width="small"
+            ),
+            "ad_name": st.column_config.TextColumn("Anuncio", width="large"),
+            "account_name": st.column_config.TextColumn("Cuenta"),
+            "campaign_name": st.column_config.TextColumn("Campaña"),
+            "cuenta_perfil": st.column_config.TextColumn("Perfil"),
+            "gasto": st.column_config.NumberColumn(
+                "Gasto (COP)", format="$%.0f"
+            ),
+            "frequency": st.column_config.NumberColumn(
+                "Frecuencia", format="%.2f"
+            ),
+            "conversaciones": st.column_config.NumberColumn(
+                "Conv.", format="%d"
+            ),
+            "n_ventas": st.column_config.NumberColumn("Nº ventas", format="%d"),
+            "monto_ventas": st.column_config.NumberColumn(
+                "Ventas (COP)", format="$%.0f"
+            ),
+            "ventas_local_info": st.column_config.TextColumn("Ventas (local)"),
+            "utilidad": st.column_config.NumberColumn(
+                "Utilidad (COP)", format="$%.0f"
+            ),
+            "costo_por_conversacion": st.column_config.NumberColumn(
+                "Costo/Conv. (COP)", format="$%.0f"
+            ),
+            "cpa": st.column_config.NumberColumn("CPA (COP)", format="$%.0f"),
+            "tasa_conversion": st.column_config.NumberColumn(
+                "% Conv→Venta", format="%.1f%%"
+            ),
+            "roas": st.column_config.NumberColumn("ROAS", format="%.2f"),
+        },
+    )
 
-        # Bounds check: si los filtros cambiaron y la selección apunta a una
-        # fila que ya no está, tratamos como "sin selección".
-        has_valid_selection = (
-            bool(selected_rows) and selected_rows[0] < len(filtered_df)
-        )
+    selected_rows = (
+        table_event.selection.rows
+        if table_event is not None and hasattr(table_event, "selection")
+        else []
+    )
+    has_valid_selection = (
+        bool(selected_rows) and selected_rows[0] < len(df_view)
+    )
 
-        with detail_container:
-            if has_valid_selection:
-                render_ad_detail(filtered_df.iloc[selected_rows[0]])
-            else:
-                st.info("Selecciona un anuncio de la tabla para ver su semáforo")
-
-        # ── KPI row: Frecuencia / CPM / Visualizaciones / CTR ────────────────
-        # Si hay selección → datos del anuncio. Si no → agregados del filtro.
+    with detail_container:
         if has_valid_selection:
-            ad = filtered_df.iloc[selected_rows[0]]
-            kpi_mode_label = (
-                f"📍 Datos del anuncio seleccionado: **{ad['ad_name']}**"
-            )
-            kpi_impressions = int(ad["impressions"])
-            kpi_gasto = float(ad["gasto"])
-            kpi_clicks = int(ad["clicks"])
-            kpi_frecuencia = (
-                float(ad["frequency"]) if ad["frequency"] > 0 else None
-            )
+            render_ad_detail(df_view.iloc[selected_rows[0]])
         else:
-            kpi_mode_label = (
-                f"📊 Totales generales — {len(filtered_df)} anuncio(s) "
-                "del filtro actual."
-            )
-            kpi_impressions = int(filtered_df["impressions"].sum())
-            kpi_reach_total = int(filtered_df["reach"].sum())
-            kpi_gasto = float(filtered_df["gasto"].sum())
-            kpi_clicks = int(filtered_df["clicks"].sum())
-            kpi_frecuencia = (
-                kpi_impressions / kpi_reach_total
-                if kpi_reach_total > 0
-                else None
-            )
+            st.info("Selecciona un anuncio de la tabla para ver su semáforo")
 
-        # Cálculos con división por cero protegida.
-        kpi_cpm = (
-            (kpi_gasto / kpi_impressions) * 1000 if kpi_impressions > 0 else None
+    if has_valid_selection:
+        ad = df_view.iloc[selected_rows[0]]
+        kpi_mode_label = (
+            f"📍 Datos del anuncio seleccionado: **{ad['ad_name']}**"
         )
-        kpi_ctr = (
-            (kpi_clicks / kpi_impressions) * 100 if kpi_impressions > 0 else None
+        kpi_impressions = int(ad["impressions"])
+        kpi_gasto = float(ad["gasto"])
+        kpi_clicks = int(ad["clicks"])
+        kpi_freq = float(ad["frequency"]) if ad["frequency"] > 0 else None
+    else:
+        kpi_mode_label = (
+            f"📊 Totales — {len(df_view)} anuncio(s) del filtro actual."
+        )
+        kpi_impressions = int(df_view["impressions"].sum())
+        kpi_reach_total = int(df_view["reach"].sum())
+        kpi_gasto = float(df_view["gasto"].sum())
+        kpi_clicks = int(df_view["clicks"].sum())
+        kpi_freq = (
+            kpi_impressions / kpi_reach_total if kpi_reach_total > 0 else None
         )
 
-        with kpi_container:
-            st.caption(kpi_mode_label)
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric(
-                "Frecuencia",
-                f"{kpi_frecuencia:.2f}" if kpi_frecuencia is not None else "—",
-                help=(
-                    "Promedio de veces que cada persona vio el anuncio "
-                    "(impresiones ÷ reach)."
-                ),
+    kpi_cpm = (
+        (kpi_gasto / kpi_impressions) * 1000 if kpi_impressions > 0 else None
+    )
+    kpi_ctr = (
+        (kpi_clicks / kpi_impressions) * 100 if kpi_impressions > 0 else None
+    )
+
+    with kpi_container:
+        st.caption(kpi_mode_label)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Frecuencia",
+            f"{kpi_freq:.2f}" if kpi_freq is not None else "—",
+        )
+        k2.metric(
+            "CPM (COP)",
+            fmt_cop(kpi_cpm) if kpi_cpm is not None else "—",
+        )
+        k3.metric("Visualizaciones", f"{kpi_impressions:,}")
+        k4.metric(
+            "CTR",
+            f"{kpi_ctr:.2f}%" if kpi_ctr is not None else "—",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Evolución diaria (helpers — se renderizan dentro de cada tab)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _render_daily_charts(daily_df: pd.DataFrame, key_suffix: str) -> None:
+    """Gráficas de gasto/ventas y conversaciones por día."""
+    st.subheader("Gasto y ventas por día")
+
+    if daily_df.empty or (
+        daily_df["gasto"].sum() == 0 and daily_df["monto_ventas"].sum() == 0
+    ):
+        st.info("Sin gasto ni ventas en el rango seleccionado.")
+    else:
+        daily_long = daily_df.melt(
+            id_vars="date",
+            value_vars=["gasto", "monto_ventas"],
+            var_name="serie",
+            value_name="valor",
+        )
+        nombres = {"gasto": "Gasto", "monto_ventas": "Ventas"}
+        daily_long["serie"] = daily_long["serie"].map(nombres)
+
+        fig_daily = px.line(
+            daily_long,
+            x="date",
+            y="valor",
+            color="serie",
+            markers=True,
+            labels={"date": "Día", "valor": "COP", "serie": ""},
+            color_discrete_map={"Gasto": "#EF553B", "Ventas": "#00CC96"},
+        )
+        fig_daily.update_layout(
+            legend_title_text="",
+            hovermode="x unified",
+            yaxis_tickformat=",.0f",
+        )
+        fig_daily.update_traces(hovertemplate="$%{y:,.0f} COP")
+        st.plotly_chart(
+            fig_daily, use_container_width=True, key=f"daily_line_{key_suffix}"
+        )
+
+    st.subheader("Conversaciones por día")
+    st.caption(
+        "Total de contactos por día de Bogotá (tabla `contactos` de Supabase)."
+    )
+
+    if daily_df.empty or daily_df["conversaciones"].sum() == 0:
+        st.info("Sin conversaciones en el rango.")
+    else:
+        fig_conv = px.bar(
+            daily_df,
+            x="date",
+            y="conversaciones",
+            labels={"date": "Día", "conversaciones": "Conversaciones"},
+            color_discrete_sequence=["#636EFA"],
+        )
+        fig_conv.update_layout(
+            hovermode="x unified",
+            yaxis_tickformat=",.0f",
+        )
+        fig_conv.update_traces(hovertemplate="%{y:,} conversaciones")
+        st.plotly_chart(
+            fig_conv, use_container_width=True, key=f"daily_conv_{key_suffix}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tabs de país en la parte superior: KPIs + Gráficas + Cuentas + Campañas + Anuncios
+# ──────────────────────────────────────────────────────────────────────────────
+
+if df.empty:
+    st.info("Sin anuncios ni ventas en el rango.")
+else:
+    tab_labels = ["🌎 Todos"]
+    all_paises = ["Todos"]
+    for p in _PAISES_ORDEN:
+        if (df["pais"] == p).any():
+            flag = _PAIS_BANDERAS.get(p, "")
+            tab_labels.append(f"{flag} {p}")
+            all_paises.append(p)
+
+    country_tabs = st.tabs(tab_labels)
+
+    for tab, pais in zip(country_tabs, all_paises):
+        with tab:
+            if pais == "Todos":
+                df_country = df
+                daily_country = daily
+            else:
+                df_country = df[df["pais"] == pais].reset_index(drop=True)
+                country_ad_ids = tuple(
+                    sorted(df_country["ad_id"].dropna().unique().tolist())
+                )
+                # Gasto/ventas por ad_id; conversaciones por contactos.pais.
+                daily_country = load_daily(
+                    since, until, ad_ids=country_ad_ids, pais=pais
+                )
+
+            # Conversaciones del país: del daily (contactos filtrado por pais),
+            # para que KPI y gráfico de conversaciones por día coincidan.
+            conv_total = int(daily_country["conversaciones"].sum())
+
+            if "pais_inconsistente" in df_country.columns:
+                n_incon = int(df_country["pais_inconsistente"].sum())
+                if n_incon > 0:
+                    st.warning(
+                        f"⚠️ {n_incon} anuncio(s) tienen país diferente en "
+                        f"Supabase vs nombre de campaña. Se usa el de Supabase."
+                    )
+
+            _render_kpis(df_country, conv_total)
+            st.divider()
+            _render_daily_charts(
+                daily_country, key_suffix=pais.lower().replace(" ", "_")
             )
-            k2.metric(
-                "CPM (COP)",
-                fmt_cop(kpi_cpm) if kpi_cpm is not None else "—",
-                help="Costo por mil impresiones = (Gasto ÷ Impresiones) × 1000.",
-            )
-            k3.metric(
-                "Visualizaciones",
-                f"{kpi_impressions:,}",
-                help="Total de impresiones del periodo.",
-            )
-            k4.metric(
-                "CTR",
-                f"{kpi_ctr:.2f}%" if kpi_ctr is not None else "—",
-                help="Click-through rate = (Clicks ÷ Impresiones) × 100.",
+            st.divider()
+            _render_accounts_table(df_country)
+            st.divider()
+            _render_campaigns_table(df_country)
+            st.divider()
+            _render_anuncios_section(
+                df_country, key_suffix=pais.lower().replace(" ", "_")
             )
 
 st.divider()
@@ -1300,7 +1401,7 @@ else:
         full_system = (
             build_system_prompt()
             + "\n\n"
-            + build_data_context(df, campaigns, accounts, daily, since, until)
+            + build_data_context(df, daily, since, until)
         )
         api_messages = [{"role": "system", "content": full_system}]
         api_messages.extend(st.session_state.chat_messages)

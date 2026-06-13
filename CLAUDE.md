@@ -50,13 +50,18 @@ de Supabase, NO de Facebook (la métrica de Facebook es menos confiable).
 **Tabla `compradores`** (ventas):
 
 - `ad_id` (text)        — id del anuncio de Facebook ← clave del cruce
-- `valor` (numeric)     — monto de la venta
+- `valor` (numeric)     — monto de la venta **en moneda local** (PEN, COP, MXN, etc.)
+- `moneda` (text, nullable) — código ISO de la moneda (NULL se asume COP)
 - `fecha_compra` (timestamptz UTC) — usada para filtrar por rango
+
+`supabase_client.get_sales()` convierte `valor` a COP usando las tasas `*_TO_COP`
+del `.env`. El DataFrame devuelve `valor_local`, `moneda` y `valor_cop`.
 
 **Tabla `contactos`** (origen real de las conversaciones de WhatsApp):
 
 - `primer_ad_id` (text, nullable) — ad_id que originó el contacto (a veces null)
 - `primer_contacto_at` (timestamptz UTC) — momento del primer contacto
+- `pais` (text, nullable) — código ISO-2 del país del contacto (NULL → Colombia)
 
 Toda agrupación o cruce por fecha se hace en **día calendario de Bogotá**
 (`America/Bogota`): los timestamps UTC se convierten con `.dt.tz_convert(BOGOTA)`
@@ -66,6 +71,13 @@ convertir y mete las ventas/contactos nocturnos en el día equivocado.
 Los contactos con `primer_ad_id` nulo se agrupan aparte en una fila
 `"Sin anuncio (no atribuido)"` para que los totales reconcilien
 (total = atribuidas + sin atribuir).
+
+**Filtro de conversaciones por país:** las conversaciones se filtran por la
+columna `pais` de `contactos` (NO por el cruce de ad_id), porque muchos
+contactos no tienen `primer_ad_id`. En cambio el **gasto** y las **ventas** se
+filtran por `ad_id` (atribución por anuncio). El KPI de conversaciones y el
+gráfico "Conversaciones por día" derivan del mismo `get_daily_totals(..., pais=)`
+para que siempre coincidan.
 
 ## Estructura del proyecto
 
@@ -78,6 +90,7 @@ Los contactos con `primer_ad_id` nulo se agrupan aparte en una fila
 ├── .env.example         # plantilla de variables (sin valores reales)
 ├── requirements.txt
 ├── src/
+│   ├── currency.py          # tasas *_TO_COP compartidas (FB gasto + ventas)
 │   ├── facebook_client.py   # gasto, frecuencia, nombre por ad_id (FB API)
 │   ├── supabase_client.py   # ventas (compradores) + contactos (Supabase)
 │   └── metrics.py           # cruza por ad_id y calcula métricas
@@ -165,8 +178,14 @@ umbrales no están definidos en el `.env`, el semáforo queda en gris ("sin dato
 
 - Las credenciales viven **solo** en `.env`. Nunca hardcodear secretos ni hacer commit de
   ellos. `.env` debe estar en `.gitignore`.
-- El acceso a Supabase y a Facebook es de **solo lectura**. Esta app no escribe ni borra nada
-  en ninguna de las dos fuentes.
+- El acceso a Facebook es siempre de **solo lectura**.
+- El acceso a Supabase es **mayoritariamente de solo lectura**. La única excepción es la
+  función `sync_ads_to_supabase(since, until)` en `src/facebook_client.py`, invocada
+  desde el botón "📥 Sincronizar anuncios con Facebook" del sidebar: hace **INSERT**
+  (nunca UPDATE ni DELETE) en la tabla `anuncios` cuando el usuario lo pide. Si el
+  `ad_id` ya existe, la fila no se toca (preserva `notas`, `producto_id`, `ad_headline`
+  y cualquier `activo=False` puesto a mano). Para escribir usa `SUPABASE_SERVICE_KEY`
+  del `.env` con fallback a `SUPABASE_KEY`.
 - Cachear las llamadas a la API de Facebook (`st.cache_data`): es lenta y tiene límites de uso.
 - Trabajar **una fase a la vez** (ver PROJECT_PLAN.md). Hacer commit cada vez que algo funcione.
 - Validar siempre los números (gasto y ventas) contra el Administrador de Anuncios de Facebook

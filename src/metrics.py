@@ -18,8 +18,9 @@ Métricas calculadas por anuncio:
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -28,13 +29,44 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import get_config  # noqa: E402
-from facebook_client import get_ad_spend, get_daily_spend  # noqa: E402
+from facebook_client import get_ad_spend, get_daily_spend, get_daily_spend_by_ad  # noqa: E402
 from supabase_client import get_contactos, get_sales  # noqa: E402
 
 SIN_NOMBRE = "(sin datos en Facebook)"
 NO_AD_LABEL = "Sin anuncio (no atribuido)"
 NO_CAMPAIGN_LABEL = "Sin campaña"
 NO_ACCOUNT_LABEL = "Sin cuenta"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# País por código en campaign_name (primeras 2 letras)
+# ──────────────────────────────────────────────────────────────────────────────
+
+PAIS_CODIGOS = {
+    "PE": "Perú",
+    "CO": "Colombia",
+    "CL": "Chile",
+    "MX": "México",
+    "VE": "Venezuela",
+    "CR": "Costa Rica",
+    "EC": "Ecuador",
+}
+
+
+def _parse_pais_campaign(campaign_name) -> str | None:
+    """Extrae el país desde las primeras 2 letras del `campaign_name`.
+
+    Devuelve el nombre largo ("Perú") o None si no matchea.
+    """
+    if not isinstance(campaign_name, str) or len(campaign_name) < 2:
+        return None
+    return PAIS_CODIGOS.get(campaign_name[:2].upper())
+
+
+def _pais_from_code(code) -> str | None:
+    """Convierte un código ISO-2 de Supabase al nombre largo del dashboard."""
+    if not isinstance(code, str) or not code.strip():
+        return None
+    return PAIS_CODIGOS.get(code.strip().upper())
 # Sentinelas usados como id ficticio para las filas "sin atribuir".
 # Empiezan por "_" para no chocar con ningún id real de Facebook.
 NO_AD_SENTINEL = "_sin_anuncio_"
@@ -42,7 +74,7 @@ NO_CAMPAIGN_SENTINEL = "_sin_campana_"
 NO_ACCOUNT_SENTINEL = "_sin_cuenta_"
 
 # Cualquier agrupación o cruce por fecha se hace en día calendario de Bogotá.
-BOGOTA = "America/Bogota"
+BOGOTA = ZoneInfo("America/Bogota")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,18 +181,39 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
             "impressions",
             "reach",
             "clicks",
+            "cuenta_perfil",
+            "estado",
+            "estado_raw",
         ]
     ]
 
     # Ventas agrupadas por ad_id (ignorando filas sin ad_id).
     if sales_df.empty:
-        sales_agg = pd.DataFrame(columns=["ad_id", "n_ventas", "monto_ventas"])
+        sales_agg = pd.DataFrame(
+            columns=["ad_id", "n_ventas", "monto_ventas", "ventas_local_info"]
+        )
     else:
         sales_with_ad = sales_df.dropna(subset=["ad_id"]).copy()
         sales_with_ad["ad_id"] = sales_with_ad["ad_id"].astype(str)
         sales_agg = sales_with_ad.groupby("ad_id", as_index=False).agg(
-            n_ventas=("valor", "size"),
-            monto_ventas=("valor", "sum"),
+            n_ventas=("valor_cop", "size"),
+            monto_ventas=("valor_cop", "sum"),
+        )
+        # Info de moneda local por ad_id para mostrar en la UI.
+        moneda_info = sales_with_ad.groupby("ad_id", as_index=False).agg(
+            _monedas=("moneda", lambda x: list(x.unique())),
+            _sum_local=("valor_local", "sum"),
+        )
+        moneda_info["ventas_local_info"] = moneda_info.apply(
+            lambda r: (
+                "Mixto"
+                if len(r["_monedas"]) > 1
+                else f"{r['_sum_local']:,.2f} {r['_monedas'][0]}"
+            ),
+            axis=1,
+        )
+        sales_agg = sales_agg.merge(
+            moneda_info[["ad_id", "ventas_local_info"]], on="ad_id", how="left"
         )
 
     # Conversaciones (solo las atribuidas a un ad_id).
@@ -180,6 +233,7 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
     merged["conversaciones"] = merged["conversaciones"].fillna(0).astype(int)
     merged["n_ventas"] = merged["n_ventas"].fillna(0).astype(int)
     merged["monto_ventas"] = merged["monto_ventas"].fillna(0.0)
+    merged["ventas_local_info"] = merged["ventas_local_info"].fillna("")
     merged["ad_name"] = merged["ad_name"].fillna(SIN_NOMBRE)
     # No tocamos campaign_id/campaign_name; el NaN lo trataremos en
     # `get_campaign_performance` para mandarlo a "Sin campaña".
@@ -210,6 +264,10 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
                             "conversaciones": n_sin_atribuir,
                             "n_ventas": 0,
                             "monto_ventas": 0.0,
+                            "ventas_local_info": "",
+                            "cuenta_perfil": None,
+                            "estado": "otro",
+                            "estado_raw": "",
                         }
                     ]
                 ),
@@ -242,32 +300,73 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
         np.nan,
     )
 
-    return merged[
-        [
-            "ad_id",
-            "ad_name",
-            "account_id",
-            "account_name",
-            "campaign_id",
-            "campaign_name",
-            "gasto",
-            "frequency",
-            "impressions",
-            "reach",
-            "clicks",
-            "conversaciones",
-            "n_ventas",
-            "monto_ventas",
-            "utilidad",
-            "costo_por_conversacion",
-            "cpa",
-            "tasa_conversion",
-            "roas",
-        ]
+    # Defensa: filas que se "crearon" en el outer merge desde sales/contactos
+    # (sin lado FB) podrían tener NaN en estado/estado_raw/cuenta_perfil.
+    merged["estado"] = merged["estado"].fillna("otro")
+    merged["estado_raw"] = merged["estado_raw"].fillna("")
+
+    # ── País: Supabase (primaria) → campaign_name (respaldo) → "Otros" ──
+    # 1) País desde Supabase `compradores.pais` (por ad_id).
+    pais_supabase: dict[str, str] = {}
+    if "pais" in sales_df.columns:
+        for _, row in (
+            sales_df.dropna(subset=["ad_id", "pais"])
+            .assign(ad_id=lambda x: x["ad_id"].astype(str))
+            .iterrows()
+        ):
+            mapped = _pais_from_code(row["pais"])
+            if mapped and row["ad_id"] not in pais_supabase:
+                pais_supabase[row["ad_id"]] = mapped
+
+    # 2) Asignar país fila a fila con prioridad.
+    def _asignar_pais(row):
+        from_supa = pais_supabase.get(row["ad_id"])
+        from_campaign = _parse_pais_campaign(row["campaign_name"])
+        return from_supa or from_campaign or "Colombia"
+
+    merged["pais"] = merged.apply(_asignar_pais, axis=1)
+
+    # 3) Marcar inconsistencias (Supabase y campaign_name dicen distinto).
+    def _check_inconsistente(row):
+        from_supa = pais_supabase.get(row["ad_id"])
+        from_campaign = _parse_pais_campaign(row["campaign_name"])
+        if from_supa and from_campaign and from_supa != from_campaign:
+            return True
+        return False
+
+    merged["pais_inconsistente"] = merged.apply(_check_inconsistente, axis=1)
+
+    out_cols = [
+        "ad_id",
+        "ad_name",
+        "account_id",
+        "account_name",
+        "campaign_id",
+        "campaign_name",
+        "pais",
+        "gasto",
+        "frequency",
+        "impressions",
+        "reach",
+        "clicks",
+        "conversaciones",
+        "n_ventas",
+        "monto_ventas",
+        "ventas_local_info",
+        "utilidad",
+        "costo_por_conversacion",
+        "cpa",
+        "tasa_conversion",
+        "roas",
+        "cuenta_perfil",
+        "estado",
+        "estado_raw",
+        "pais_inconsistente",
     ]
+    return merged[out_cols]
 
 
-def _aggregate_by(ad_df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+def aggregate_by(ad_df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     """Helper: agrega `ad_df` sumando las columnas de embudo y recalcula
     utilidad, ROAS, CPA, costo/conv y tasa de conversión sin dividir por cero.
     """
@@ -322,7 +421,7 @@ def get_campaign_performance(since: str, until: str) -> pd.DataFrame:
     ad_df["campaign_id"] = ad_df["campaign_id"].fillna(NO_CAMPAIGN_SENTINEL)
     ad_df["campaign_name"] = ad_df["campaign_name"].fillna(NO_CAMPAIGN_LABEL)
 
-    grouped = _aggregate_by(ad_df, ["campaign_id", "campaign_name"])
+    grouped = aggregate_by(ad_df, ["campaign_id", "campaign_name"])
     return grouped[
         [
             "campaign_id",
@@ -359,7 +458,7 @@ def get_account_performance(since: str, until: str) -> pd.DataFrame:
     ad_df["account_id"] = ad_df["account_id"].fillna(NO_ACCOUNT_SENTINEL)
     ad_df["account_name"] = ad_df["account_name"].fillna(NO_ACCOUNT_LABEL)
 
-    grouped = _aggregate_by(ad_df, ["account_id", "account_name"])
+    grouped = aggregate_by(ad_df, ["account_id", "account_name"])
     return grouped[
         [
             "account_id",
@@ -378,7 +477,12 @@ def get_account_performance(since: str, until: str) -> pd.DataFrame:
     ]
 
 
-def get_daily_totals(since: str, until: str) -> pd.DataFrame:
+def get_daily_totals(
+    since: str,
+    until: str,
+    ad_ids: set[str] | None = None,
+    pais: str | None = None,
+) -> pd.DataFrame:
     """Totales diarios agrupados por día de Bogotá.
 
     Devuelve un DataFrame con una fila por día del rango y columnas:
@@ -386,17 +490,54 @@ def get_daily_totals(since: str, until: str) -> pd.DataFrame:
 
     - `gasto` viene de Facebook (en COP).
     - `monto_ventas` y `n_ventas` vienen de `compradores`.
-    - `conversaciones` viene de `contactos` y cuenta **TODOS los contactos**
-      del día (incluidos los que tienen `primer_ad_id` nulo), agrupados por
-      `primer_contacto_at` convertido a día de Bogotá.
+    - `conversaciones` viene de `contactos` y cuenta TODOS los contactos del
+      día (incluidos los que tienen `primer_ad_id` nulo).
+
+    Filtros por país:
+    - `ad_ids` filtra el GASTO y las VENTAS a esos anuncios (atribución por
+      ad_id, igual que la tabla por anuncio).
+    - `pais` (nombre largo, ej. "Colombia") filtra las CONVERSACIONES usando
+      la columna `pais` de la tabla `contactos` (NULL/desconocido → "Colombia"),
+      independientemente del cruce por ad_id. Así las conversaciones por país
+      no dependen de que el contacto tenga `primer_ad_id`.
 
     Incluye los días sin actividad (con ceros) para que la gráfica no salte
     huecos. NO se usa `tz_localize(None)`; UTC se convierte explícitamente
     a Bogotá antes de tomar el día.
     """
-    spend = get_daily_spend(since, until).rename(columns={"spend": "gasto"})
     sales_df = get_sales(since, until)
     contactos_df = get_contactos(since, until)
+
+    if ad_ids is not None:
+        # Gasto diario por anuncio, filtrado a los ad_ids del país.
+        spend_by_ad = get_daily_spend_by_ad(since, until)
+        if not spend_by_ad.empty:
+            spend_by_ad = spend_by_ad[
+                spend_by_ad["ad_id"].isin(ad_ids)
+            ]
+            spend = (
+                spend_by_ad.groupby("date", as_index=False)["spend"]
+                .sum()
+                .rename(columns={"spend": "gasto"})
+            )
+        else:
+            spend = pd.DataFrame(columns=["date", "gasto"])
+
+        if not sales_df.empty:
+            sales_df = sales_df[
+                sales_df["ad_id"].astype(str).isin(ad_ids)
+            ]
+    else:
+        spend = get_daily_spend(since, until).rename(columns={"spend": "gasto"})
+
+    # Conversaciones: filtrar por la columna `pais` de `contactos` (no por
+    # ad_id), para no perder los contactos sin `primer_ad_id`.
+    if pais is not None and not contactos_df.empty and "pais" in contactos_df.columns:
+        contactos_df = contactos_df.copy()
+        contactos_df["_pais"] = contactos_df["pais"].apply(
+            lambda c: _pais_from_code(c) or "Colombia"
+        )
+        contactos_df = contactos_df[contactos_df["_pais"] == pais]
 
     # Ventas por día de Bogotá (monto + conteo).
     if not sales_df.empty:
@@ -407,13 +548,13 @@ def get_daily_totals(since: str, until: str) -> pd.DataFrame:
             .dt.date
         )
         sales = sales_df.groupby("date", as_index=False).agg(
-            monto_ventas=("valor", "sum"),
-            n_ventas=("valor", "size"),
+            monto_ventas=("valor_cop", "sum"),
+            n_ventas=("valor_cop", "size"),
         )
     else:
         sales = pd.DataFrame(columns=["date", "monto_ventas", "n_ventas"])
 
-    # Conversaciones por día de Bogotá → TODOS los contactos (con y sin ad_id).
+    # Conversaciones por día de Bogotá.
     if not contactos_df.empty:
         contactos_df = contactos_df.copy()
         contactos_df["date"] = (
@@ -430,7 +571,6 @@ def get_daily_totals(since: str, until: str) -> pd.DataFrame:
         contactos_daily = pd.DataFrame(columns=["date", "conversaciones"])
 
     if not spend.empty:
-        # Facebook ya entrega `date_start` como "YYYY-MM-DD" (día sin hora).
         spend["date"] = pd.to_datetime(spend["date"]).dt.date
 
     # Esqueleto con todos los días del rango como objetos `date`.
@@ -451,7 +591,7 @@ def get_daily_totals(since: str, until: str) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    today = date.today()
+    today = datetime.now(BOGOTA).date()
     since = (today - timedelta(days=7)).isoformat()
     until = today.isoformat()
 
