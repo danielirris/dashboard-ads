@@ -482,6 +482,7 @@ def get_daily_totals(
     until: str,
     ad_ids: set[str] | None = None,
     pais: str | None = None,
+    spend_by_ad_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Totales diarios agrupados por día de Bogotá.
 
@@ -509,8 +510,13 @@ def get_daily_totals(
     contactos_df = get_contactos(since, until)
 
     if ad_ids is not None:
-        # Gasto diario por anuncio, filtrado a los ad_ids del país.
-        spend_by_ad = get_daily_spend_by_ad(since, until)
+        # Gasto diario por anuncio, filtrado a los ad_ids del país. Si el
+        # llamador ya lo trae cacheado (app.py), lo usa; si no, lo pide a FB.
+        spend_by_ad = (
+            spend_by_ad_df
+            if spend_by_ad_df is not None
+            else get_daily_spend_by_ad(since, until)
+        )
         if not spend_by_ad.empty:
             spend_by_ad = spend_by_ad[
                 spend_by_ad["ad_id"].isin(ad_ids)

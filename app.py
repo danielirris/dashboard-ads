@@ -23,7 +23,10 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import get_config, save_config  # noqa: E402
-from facebook_client import sync_ads_to_supabase  # noqa: E402
+from facebook_client import (  # noqa: E402
+    get_daily_spend_by_ad,
+    sync_ads_to_supabase,
+)
 from metrics import (  # noqa: E402
     NO_ACCOUNT_LABEL,
     NO_CAMPAIGN_LABEL,
@@ -71,6 +74,18 @@ def load_performance(since: str, until: str) -> pd.DataFrame:
     return get_ad_performance(since, until)
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando gasto diario por anuncio…")
+def load_daily_spend_by_ad(since: str, until: str) -> pd.DataFrame:
+    """Gasto diario por anuncio (FB), cacheado con TTL y refrescable.
+
+    Se cachea aquí —y NO con `@lru_cache` en facebook_client— para que el
+    botón "🔄 Refrescar datos" (que llama `st.cache_data.clear()`) y el TTL de
+    10 min lo actualicen. Una sola llamada a FB por refresco, compartida por
+    todas las tabs de país.
+    """
+    return get_daily_spend_by_ad(since, until)
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando evolución diaria…")
 def load_daily(
     since: str,
@@ -78,8 +93,13 @@ def load_daily(
     ad_ids: tuple[str, ...] | None = None,
     pais: str | None = None,
 ) -> pd.DataFrame:
+    # Para las tabs de país (ad_ids dado) traemos el gasto-por-anuncio ya
+    # cacheado y se lo pasamos a get_daily_totals, que solo lo filtra.
+    spend_by_ad = (
+        load_daily_spend_by_ad(since, until) if ad_ids else None
+    )
     return get_daily_totals(
-        since, until, set(ad_ids) if ad_ids else None, pais
+        since, until, set(ad_ids) if ad_ids else None, pais, spend_by_ad
     )
 
 

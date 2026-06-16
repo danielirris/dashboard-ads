@@ -483,12 +483,16 @@ def get_daily_spend(since: str, until: str) -> pd.DataFrame:
     return df.sort_values("date", ignore_index=True)
 
 
-@lru_cache(maxsize=4)
 def get_daily_spend_by_ad(since: str, until: str) -> pd.DataFrame:
     """Gasto diario por anuncio de todas las cuentas, en COP.
 
     Devuelve columnas: date (str YYYY-MM-DD), ad_id (str), spend (float COP).
     Usa `level=ad` con `time_increment=1` para desglosar por anuncio y día.
+
+    NO cachear con `@lru_cache` aquí: ese caché vive por todo el proceso y no
+    lo limpia el botón "Refrescar datos" del dashboard (que solo borra
+    `st.cache_data`), dejando la gráfica diaria congelada. El cacheo se hace
+    en `app.py` con `@st.cache_data` (respeta el TTL y el botón Refrescar).
     """
     parts = []
     for acc in _account_ids():
