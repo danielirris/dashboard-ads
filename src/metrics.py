@@ -369,6 +369,10 @@ def get_ad_performance(since: str, until: str) -> pd.DataFrame:
 def aggregate_by(ad_df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     """Helper: agrega `ad_df` sumando las columnas de embudo y recalcula
     utilidad, ROAS, CPA, costo/conv y tasa de conversión sin dividir por cero.
+
+    Si `ad_df` trae las columnas de ventanas móviles (`gasto_3d`, `ventas_3d`,
+    `gasto_7d`, `ventas_7d`), también las suma y calcula `roas_3d` y `roas_7d`
+    a nivel del grupo.
     """
     grouped = ad_df.groupby(group_cols, as_index=False).agg(
         n_anuncios=("ad_id", "count"),
@@ -398,9 +402,95 @@ def aggregate_by(ad_df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
         100.0 * grouped["n_ventas"] / grouped["conversaciones"].replace(0, np.nan),
         np.nan,
     )
+
+    # ROAS de ventanas móviles (últimos 3 y 7 días), si vienen en ad_df.
+    roll_cols = ["gasto_3d", "ventas_3d", "gasto_7d", "ventas_7d"]
+    if all(c in ad_df.columns for c in roll_cols):
+        roll = ad_df.groupby(group_cols, as_index=False)[roll_cols].sum()
+        grouped = grouped.merge(roll, on=group_cols, how="left")
+        grouped["roas_3d"] = np.where(
+            grouped["gasto_3d"] > 0,
+            grouped["ventas_3d"] / grouped["gasto_3d"].replace(0, np.nan),
+            np.nan,
+        )
+        grouped["roas_7d"] = np.where(
+            grouped["gasto_7d"] > 0,
+            grouped["ventas_7d"] / grouped["gasto_7d"].replace(0, np.nan),
+            np.nan,
+        )
+
     return grouped.sort_values(
         "monto_ventas", ascending=False, ignore_index=True
     )
+
+
+def get_rolling_roas_by_ad(today: str) -> pd.DataFrame:
+    """ROAS por anuncio en ventanas móviles de 3 y 7 días terminando HOY.
+
+    `today` es el día calendario de Bogotá (YYYY-MM-DD). Las ventanas son
+    fijas e **independientes del rango seleccionado** en el dashboard:
+    - 3 días: [today-2, today] (ej. si hoy es 16 → 14, 15, 16)
+    - 7 días: [today-6, today]
+
+    Columnas: ad_id, gasto_3d, ventas_3d, gasto_7d, ventas_7d, roas_3d, roas_7d.
+    El gasto viene de Facebook (por anuncio y día) y las ventas de Supabase
+    (`compradores`, en COP, por día de Bogotá). ROAS = ventas ÷ gasto; NaN
+    cuando no hubo gasto en la ventana.
+    """
+    today_d = datetime.strptime(today, "%Y-%m-%d").date()
+    since_7d = (today_d - timedelta(days=6)).isoformat()
+    start_3d = today_d - timedelta(days=2)
+
+    # Gasto por anuncio (FB). `date` viene como 'YYYY-MM-DD'.
+    spend = get_daily_spend_by_ad(since_7d, today)
+    if not spend.empty:
+        spend = spend.copy()
+        spend["ad_id"] = spend["ad_id"].astype(str)
+        spend["d"] = pd.to_datetime(spend["date"]).dt.date
+        gasto_7d = spend.groupby("ad_id")["spend"].sum()
+        gasto_3d = spend[spend["d"] >= start_3d].groupby("ad_id")["spend"].sum()
+    else:
+        gasto_7d = pd.Series(dtype=float)
+        gasto_3d = pd.Series(dtype=float)
+
+    # Ventas por anuncio (Supabase), por día de Bogotá.
+    sales = get_sales(since_7d, today)
+    if not sales.empty:
+        sales = sales.dropna(subset=["ad_id"]).copy()
+        sales["ad_id"] = sales["ad_id"].astype(str)
+        sales["d"] = (
+            pd.to_datetime(sales["fecha_compra"], utc=True)
+            .dt.tz_convert(BOGOTA)
+            .dt.date
+        )
+        ventas_7d = sales.groupby("ad_id")["valor_cop"].sum()
+        ventas_3d = (
+            sales[sales["d"] >= start_3d].groupby("ad_id")["valor_cop"].sum()
+        )
+    else:
+        ventas_7d = pd.Series(dtype=float)
+        ventas_3d = pd.Series(dtype=float)
+
+    out = pd.DataFrame(
+        {
+            "gasto_3d": gasto_3d,
+            "ventas_3d": ventas_3d,
+            "gasto_7d": gasto_7d,
+            "ventas_7d": ventas_7d,
+        }
+    ).fillna(0.0)
+    out["roas_3d"] = np.where(
+        out["gasto_3d"] > 0,
+        out["ventas_3d"] / out["gasto_3d"].replace(0, np.nan),
+        np.nan,
+    )
+    out["roas_7d"] = np.where(
+        out["gasto_7d"] > 0,
+        out["ventas_7d"] / out["gasto_7d"].replace(0, np.nan),
+        np.nan,
+    )
+    out.index.name = "ad_id"
+    return out.reset_index()
 
 
 def get_campaign_performance(since: str, until: str) -> pd.DataFrame:

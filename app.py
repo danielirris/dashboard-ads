@@ -37,6 +37,7 @@ from metrics import (  # noqa: E402
     cpa_status,
     get_ad_performance,
     get_daily_totals,
+    get_rolling_roas_by_ad,
     roas_status,
 )
 
@@ -72,6 +73,12 @@ BOGOTA = ZoneInfo("America/Bogota")
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando rendimiento por anuncio…")
 def load_performance(since: str, until: str) -> pd.DataFrame:
     return get_ad_performance(since, until)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando ROAS reciente…")
+def load_rolling(today: str) -> pd.DataFrame:
+    """ROAS por anuncio en ventanas móviles de 3 y 7 días (cacheado por día)."""
+    return get_rolling_roas_by_ad(today)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="Cargando gasto diario por anuncio…")
@@ -562,6 +569,15 @@ with st.sidebar.expander("⚙️ Configuración del negocio", expanded=False):
 df = load_performance(since, until)
 daily = load_daily(since, until)
 
+# ROAS de ventanas móviles (últimos 3 y 7 días desde HOY en Bogotá), fijo e
+# independiente del rango seleccionado. Se cruza por ad_id; los anuncios sin
+# actividad reciente quedan con gasto_3d/7d = 0 → ROAS NaN (semáforo gris).
+today_str = datetime.now(BOGOTA).date().isoformat()
+rolling = load_rolling(today_str)
+if not df.empty:
+    df["ad_id"] = df["ad_id"].astype(str)
+    df = df.merge(rolling, on="ad_id", how="left")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Header
@@ -676,18 +692,20 @@ def _render_accounts_table(df_country: pd.DataFrame) -> None:
             "cpa": "CPA",
             "tasa_conversion": "% Conv→Venta",
             "roas": "ROAS",
+            "roas_3d": "ROAS 3d",
+            "roas_7d": "ROAS 7d",
         }
     )[
         [
             "Cuenta", "Anuncios", "Gasto", "Conv.", "Ventas",
             "Ventas (COP)", "Utilidad", "Costo/Conv.", "CPA",
-            "% Conv→Venta", "ROAS",
+            "% Conv→Venta", "ROAS", "ROAS 3d", "ROAS 7d",
         ]
     ]
     styled = (
         acc_display.style
         .map(_cpa_cell_style, subset=["CPA"])
-        .map(_roas_cell_style, subset=["ROAS"])
+        .map(_roas_cell_style, subset=["ROAS", "ROAS 3d", "ROAS 7d"])
         .format(
             {
                 "Anuncios": "{:,.0f}",
@@ -700,6 +718,8 @@ def _render_accounts_table(df_country: pd.DataFrame) -> None:
                 "CPA": _fmt_money_or_dash,
                 "% Conv→Venta": _fmt_pct_or_dash,
                 "ROAS": _fmt_roas_or_dash,
+                "ROAS 3d": _fmt_roas_or_dash,
+                "ROAS 7d": _fmt_roas_or_dash,
             }
         )
     )
@@ -733,18 +753,20 @@ def _render_campaigns_table(df_country: pd.DataFrame) -> None:
             "cpa": "CPA",
             "tasa_conversion": "% Conv→Venta",
             "roas": "ROAS",
+            "roas_3d": "ROAS 3d",
+            "roas_7d": "ROAS 7d",
         }
     )[
         [
             "Campaña", "Anuncios", "Gasto", "Conv.", "Ventas",
             "Ventas (COP)", "Utilidad", "Costo/Conv.", "CPA",
-            "% Conv→Venta", "ROAS",
+            "% Conv→Venta", "ROAS", "ROAS 3d", "ROAS 7d",
         ]
     ]
     styled = (
         camp_display.style
         .map(_cpa_cell_style, subset=["CPA"])
-        .map(_roas_cell_style, subset=["ROAS"])
+        .map(_roas_cell_style, subset=["ROAS", "ROAS 3d", "ROAS 7d"])
         .format(
             {
                 "Anuncios": "{:,.0f}",
@@ -757,6 +779,8 @@ def _render_campaigns_table(df_country: pd.DataFrame) -> None:
                 "CPA": _fmt_money_or_dash,
                 "% Conv→Venta": _fmt_pct_or_dash,
                 "ROAS": _fmt_roas_or_dash,
+                "ROAS 3d": _fmt_roas_or_dash,
+                "ROAS 7d": _fmt_roas_or_dash,
             }
         )
     )
@@ -884,10 +908,21 @@ def _render_anuncios_section(df_country: pd.DataFrame, key_suffix: str) -> None:
     drop_cols = [
         "ad_id", "account_id", "campaign_id", "impressions", "reach",
         "clicks", "estado", "estado_raw", "pais", "pais_inconsistente",
+        "gasto_3d", "ventas_3d", "gasto_7d", "ventas_7d",
     ]
     table_df = table_df.drop(
         columns=[c for c in drop_cols if c in table_df.columns]
     )
+
+    # Ubicar ROAS 3d / 7d justo después de ROAS para leerlos juntos.
+    cols = list(table_df.columns)
+    for c in ("roas_3d", "roas_7d"):
+        if c in cols:
+            cols.remove(c)
+    if "roas" in cols:
+        i = cols.index("roas") + 1
+        cols[i:i] = [c for c in ("roas_3d", "roas_7d") if c in table_df.columns]
+    table_df = table_df[cols]
 
     table_event = st.dataframe(
         table_df,
@@ -929,6 +964,18 @@ def _render_anuncios_section(df_country: pd.DataFrame, key_suffix: str) -> None:
                 "% Conv→Venta", format="%.1f%%"
             ),
             "roas": st.column_config.NumberColumn("ROAS", format="%.2f"),
+            "roas_3d": st.column_config.NumberColumn(
+                "ROAS 3d",
+                format="%.2f",
+                help="ROAS de los últimos 3 días (hoy y los 2 anteriores), "
+                "fijo e independiente del rango seleccionado.",
+            ),
+            "roas_7d": st.column_config.NumberColumn(
+                "ROAS 7d",
+                format="%.2f",
+                help="ROAS de los últimos 7 días, fijo e independiente del "
+                "rango seleccionado.",
+            ),
         },
     )
 
@@ -1060,6 +1107,246 @@ def _render_daily_charts(daily_df: pd.DataFrame, key_suffix: str) -> None:
         )
 
 
+def _render_extra_sections(
+    df_country: pd.DataFrame, daily_country: pd.DataFrame, key_suffix: str
+) -> None:
+    """Top anuncios, embudo, ganancia por día y tasa de conversión por día,
+    todos filtrados al país de la pestaña (df_country / daily_country)."""
+
+    # ── Top anuncios por ventas ─────────────────────────────────────────────
+    st.subheader("Top anuncios por ventas")
+    top_n = st.slider(
+        "¿Cuántos mostrar?",
+        min_value=5,
+        max_value=30,
+        value=15,
+        step=5,
+        key=f"top_n_{key_suffix}",
+    )
+    top = df_country[df_country["monto_ventas"] > 0].head(top_n)
+
+    if top.empty:
+        st.info("Aún no hay anuncios con ventas en este rango.")
+    else:
+        top = top.copy()
+        top["label"] = top["ad_name"].apply(
+            lambda s: s if len(s) <= 50 else s[:47] + "…"
+        )
+        fig_top = px.bar(
+            top.iloc[::-1],
+            x="monto_ventas",
+            y="label",
+            orientation="h",
+            labels={"monto_ventas": "Monto de ventas (COP)", "label": ""},
+            text="monto_ventas",
+            color="roas",
+            color_continuous_scale="RdYlGn",
+            hover_data={"label": False, "ad_name": True, "roas": ":.2f", "monto_ventas": ":,.0f"},
+        )
+        fig_top.update_traces(texttemplate="$%{x:,.0f}", textposition="outside")
+        fig_top.update_layout(
+            height=max(350, 35 * len(top)),
+            xaxis_tickformat=",.0f",
+            coloraxis_colorbar=dict(title="ROAS"),
+        )
+        st.plotly_chart(
+            fig_top, use_container_width=True, key=f"top_ads_{key_suffix}"
+        )
+
+    st.divider()
+
+    # ── Embudo: conversaciones → ventas por anuncio ─────────────────────────
+    st.subheader("Embudo: conversaciones → ventas por anuncio")
+    st.caption(
+        "Compara cuántas conversaciones genera cada anuncio en WhatsApp con cuántas "
+        "terminan en venta. El porcentaje al lado de la barra verde es la tasa de "
+        "conversión del speech (ventas ÷ conversaciones)."
+    )
+
+    funnel_n = st.slider(
+        "¿Cuántos anuncios mostrar?",
+        min_value=5,
+        max_value=30,
+        value=15,
+        step=5,
+        key=f"funnel_n_{key_suffix}",
+    )
+
+    funnel_df = (
+        df_country[(df_country["conversaciones"] > 0) | (df_country["n_ventas"] > 0)]
+        .sort_values("conversaciones", ascending=False)
+        .head(funnel_n)
+        .copy()
+    )
+
+    if funnel_df.empty:
+        st.info("Aún no hay conversaciones ni ventas en este rango.")
+    else:
+        funnel_df["label"] = funnel_df["ad_name"].apply(
+            lambda s: s if len(s) <= 50 else s[:47] + "…"
+        )
+        funnel_df = funnel_df.iloc[::-1]
+
+        ventas_text = [
+            f"{int(n):,}" + (f"  ({t:.1f}%)" if pd.notna(t) else "")
+            for n, t in zip(funnel_df["n_ventas"], funnel_df["tasa_conversion"])
+        ]
+
+        fig_funnel = go.Figure()
+        fig_funnel.add_trace(
+            go.Bar(
+                name="Conversaciones",
+                y=funnel_df["label"],
+                x=funnel_df["conversaciones"],
+                orientation="h",
+                marker_color="#636EFA",
+                text=funnel_df["conversaciones"].apply(lambda v: f"{int(v):,}"),
+                textposition="outside",
+                hovertemplate="<b>%{customdata}</b><br>Conversaciones: %{x:,}<extra></extra>",
+                customdata=funnel_df["ad_name"],
+            )
+        )
+        fig_funnel.add_trace(
+            go.Bar(
+                name="Ventas",
+                y=funnel_df["label"],
+                x=funnel_df["n_ventas"],
+                orientation="h",
+                marker_color="#00CC96",
+                text=ventas_text,
+                textposition="outside",
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Ventas: %{x:,}<br>"
+                    "Tasa conv.: %{customdata[1]}<extra></extra>"
+                ),
+                customdata=list(
+                    zip(
+                        funnel_df["ad_name"],
+                        funnel_df["tasa_conversion"].apply(
+                            lambda t: f"{t:.1f}%" if pd.notna(t) else "—"
+                        ),
+                    )
+                ),
+            )
+        )
+        fig_funnel.update_layout(
+            barmode="group",
+            height=max(400, 45 * len(funnel_df)),
+            xaxis_title="Cantidad",
+            yaxis_title="",
+            legend_title="",
+            margin=dict(l=10, r=80, t=20, b=40),
+        )
+        st.plotly_chart(
+            fig_funnel, use_container_width=True, key=f"funnel_{key_suffix}"
+        )
+
+    st.divider()
+
+    # ── Ganancia por día ────────────────────────────────────────────────────
+    st.subheader("Ganancia por día")
+
+    if daily_country.empty:
+        st.info("Sin datos diarios en el rango.")
+    else:
+        st.caption(
+            "Ganancia diaria = ventas del día − gasto del día.  🟢 ganancia · 🔴 pérdida."
+        )
+
+        daily_g = daily_country.copy()
+        daily_g["ganancia"] = daily_g["monto_ventas"] - daily_g["gasto"]
+        daily_g["signo"] = daily_g["ganancia"].apply(
+            lambda g: "Ganancia" if g >= 0 else "Pérdida"
+        )
+
+        fig_profit = px.bar(
+            daily_g,
+            x="date",
+            y="ganancia",
+            color="signo",
+            color_discrete_map={"Ganancia": "#28a745", "Pérdida": "#dc3545"},
+            category_orders={"signo": ["Ganancia", "Pérdida"]},
+            labels={"date": "Día", "ganancia": "Ganancia (COP)", "signo": ""},
+        )
+        meta_diaria = float(get_config()["meta_ganancia_diaria"])
+        if meta_diaria > 0:
+            fig_profit.add_hline(
+                y=meta_diaria,
+                line_dash="dash",
+                line_color="#0066cc",
+                annotation_text=f"Meta diaria: ${meta_diaria:,.0f}",
+                annotation_position="top right",
+                annotation_font_color="#0066cc",
+            )
+        fig_profit.update_layout(
+            legend_title_text="",
+            yaxis_tickformat=",.0f",
+            hovermode="x unified",
+        )
+        fig_profit.update_traces(hovertemplate="$%{y:,.0f} COP")
+        st.plotly_chart(
+            fig_profit, use_container_width=True, key=f"profit_{key_suffix}"
+        )
+
+        n_pos = int((daily_g["ganancia"] > 0).sum())
+        n_neg = int((daily_g["ganancia"] < 0).sum())
+        n_meta = int((daily_g["ganancia"] >= meta_diaria).sum()) if meta_diaria > 0 else None
+        total_periodo = float(daily_g["ganancia"].sum())
+        meta_str = (
+            f"  ·  días sobre meta ({fmt_cop(meta_diaria)}): **{n_meta}**"
+            if n_meta is not None
+            else ""
+        )
+        st.caption(
+            f"Días con ganancia: **{n_pos}**  ·  con pérdida: **{n_neg}**{meta_str}  "
+            f"·  acumulada del periodo: **{fmt_cop(total_periodo)}**."
+        )
+
+    st.divider()
+
+    # ── Tasa de conversión por día ──────────────────────────────────────────
+    st.subheader("Tasa de conversión por día")
+
+    if daily_country.empty:
+        st.info("Sin datos diarios en el rango.")
+    elif daily_country["conversaciones"].sum() == 0:
+        st.info("Sin conversaciones en el rango — no se puede calcular la tasa.")
+    else:
+        st.caption(
+            "Tasa de conversión diaria = (nº ventas del día ÷ conversaciones del "
+            "día) × 100. Los días con 0 conversaciones se omiten de la línea."
+        )
+
+        daily_r = daily_country.copy()
+        daily_r["tasa"] = np.where(
+            daily_r["conversaciones"] > 0,
+            100.0 * daily_r["n_ventas"] / daily_r["conversaciones"].replace(0, np.nan),
+            np.nan,
+        )
+
+        fig_rate = px.line(
+            daily_r,
+            x="date",
+            y="tasa",
+            markers=True,
+            labels={"date": "Día", "tasa": "Tasa de conversión (%)"},
+            color_discrete_sequence=["#00CC96"],
+        )
+        fig_rate.update_layout(
+            hovermode="x unified",
+            yaxis_tickformat=".1f",
+            yaxis_ticksuffix="%",
+        )
+        fig_rate.update_traces(
+            connectgaps=False,
+            hovertemplate="%{y:.1f}%",
+        )
+        st.plotly_chart(
+            fig_rate, use_container_width=True, key=f"rate_{key_suffix}"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Tabs de país en la parte superior: KPIs + Gráficas + Cuentas + Campañas + Anuncios
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1117,255 +1404,12 @@ else:
             _render_anuncios_section(
                 df_country, key_suffix=pais.lower().replace(" ", "_")
             )
-
-st.divider()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Ranking de los que más venden
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Top anuncios por ventas")
-
-top_n = st.slider("¿Cuántos mostrar?", min_value=5, max_value=30, value=15, step=5)
-top = df[df["monto_ventas"] > 0].head(top_n)
-
-if top.empty:
-    st.info("Aún no hay anuncios con ventas en este rango.")
-else:
-    # Truncamos nombres largos para que la gráfica sea legible.
-    top = top.copy()
-    top["label"] = top["ad_name"].apply(
-        lambda s: s if len(s) <= 50 else s[:47] + "…"
-    )
-    fig_top = px.bar(
-        top.iloc[::-1],  # invertimos para que el #1 quede arriba
-        x="monto_ventas",
-        y="label",
-        orientation="h",
-        labels={"monto_ventas": "Monto de ventas (COP)", "label": ""},
-        text="monto_ventas",
-        color="roas",
-        color_continuous_scale="RdYlGn",
-        hover_data={"label": False, "ad_name": True, "roas": ":.2f", "monto_ventas": ":,.0f"},
-    )
-    fig_top.update_traces(texttemplate="$%{x:,.0f}", textposition="outside")
-    fig_top.update_layout(
-        height=max(350, 35 * len(top)),
-        xaxis_tickformat=",.0f",
-        coloraxis_colorbar=dict(title="ROAS"),
-    )
-    st.plotly_chart(fig_top, use_container_width=True)
-
-
-st.divider()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Embudo: conversaciones vs ventas
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Embudo: conversaciones → ventas por anuncio")
-st.caption(
-    "Compara cuántas conversaciones genera cada anuncio en WhatsApp con cuántas "
-    "terminan en venta. El porcentaje al lado de la barra verde es la tasa de "
-    "conversión del speech (ventas ÷ conversaciones)."
-)
-
-funnel_n = st.slider(
-    "¿Cuántos anuncios mostrar?",
-    min_value=5,
-    max_value=30,
-    value=15,
-    step=5,
-    key="funnel_n",
-)
-
-# Ordenamos por conversaciones (volumen de entrada al embudo).
-funnel_df = (
-    df[(df["conversaciones"] > 0) | (df["n_ventas"] > 0)]
-    .sort_values("conversaciones", ascending=False)
-    .head(funnel_n)
-    .copy()
-)
-
-if funnel_df.empty:
-    st.info("Aún no hay conversaciones ni ventas en este rango.")
-else:
-    funnel_df["label"] = funnel_df["ad_name"].apply(
-        lambda s: s if len(s) <= 50 else s[:47] + "…"
-    )
-    # Invertimos para que el de más conversaciones quede arriba en la gráfica.
-    funnel_df = funnel_df.iloc[::-1]
-
-    ventas_text = [
-        f"{int(n):,}" + (f"  ({t:.1f}%)" if pd.notna(t) else "")
-        for n, t in zip(funnel_df["n_ventas"], funnel_df["tasa_conversion"])
-    ]
-
-    fig_funnel = go.Figure()
-    fig_funnel.add_trace(
-        go.Bar(
-            name="Conversaciones",
-            y=funnel_df["label"],
-            x=funnel_df["conversaciones"],
-            orientation="h",
-            marker_color="#636EFA",
-            text=funnel_df["conversaciones"].apply(lambda v: f"{int(v):,}"),
-            textposition="outside",
-            hovertemplate="<b>%{customdata}</b><br>Conversaciones: %{x:,}<extra></extra>",
-            customdata=funnel_df["ad_name"],
-        )
-    )
-    fig_funnel.add_trace(
-        go.Bar(
-            name="Ventas",
-            y=funnel_df["label"],
-            x=funnel_df["n_ventas"],
-            orientation="h",
-            marker_color="#00CC96",
-            text=ventas_text,
-            textposition="outside",
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Ventas: %{x:,}<br>"
-                "Tasa conv.: %{customdata[1]}<extra></extra>"
-            ),
-            customdata=list(
-                zip(
-                    funnel_df["ad_name"],
-                    funnel_df["tasa_conversion"].apply(
-                        lambda t: f"{t:.1f}%" if pd.notna(t) else "—"
-                    ),
-                )
-            ),
-        )
-    )
-    fig_funnel.update_layout(
-        barmode="group",
-        height=max(400, 45 * len(funnel_df)),
-        xaxis_title="Cantidad",
-        yaxis_title="",
-        legend_title="",
-        margin=dict(l=10, r=80, t=20, b=40),
-    )
-    st.plotly_chart(fig_funnel, use_container_width=True)
-
-
-st.divider()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Ganancia por día (días de Bogotá, verde = ganancia, rojo = pérdida)
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Ganancia por día")
-
-if daily.empty:
-    st.info("Sin datos diarios en el rango.")
-else:
-    st.caption(
-        "Ganancia diaria = ventas del día − gasto del día.  🟢 ganancia · 🔴 pérdida."
-    )
-
-    daily_g = daily.copy()
-    daily_g["ganancia"] = daily_g["monto_ventas"] - daily_g["gasto"]
-    daily_g["signo"] = daily_g["ganancia"].apply(
-        lambda g: "Ganancia" if g >= 0 else "Pérdida"
-    )
-
-    fig_profit = px.bar(
-        daily_g,
-        x="date",
-        y="ganancia",
-        color="signo",
-        color_discrete_map={"Ganancia": "#28a745", "Pérdida": "#dc3545"},
-        category_orders={"signo": ["Ganancia", "Pérdida"]},
-        labels={"date": "Día", "ganancia": "Ganancia (COP)", "signo": ""},
-    )
-    # Línea de referencia con la meta diaria configurada.
-    meta_diaria = float(get_config()["meta_ganancia_diaria"])
-    if meta_diaria > 0:
-        fig_profit.add_hline(
-            y=meta_diaria,
-            line_dash="dash",
-            line_color="#0066cc",
-            annotation_text=f"Meta diaria: ${meta_diaria:,.0f}",
-            annotation_position="top right",
-            annotation_font_color="#0066cc",
-        )
-    fig_profit.update_layout(
-        legend_title_text="",
-        yaxis_tickformat=",.0f",
-        hovermode="x unified",
-    )
-    fig_profit.update_traces(hovertemplate="$%{y:,.0f} COP")
-    st.plotly_chart(fig_profit, use_container_width=True)
-
-    # Resumen al pie: días positivos / negativos, días sobre la meta y acumulado.
-    n_pos = int((daily_g["ganancia"] > 0).sum())
-    n_neg = int((daily_g["ganancia"] < 0).sum())
-    n_meta = int((daily_g["ganancia"] >= meta_diaria).sum()) if meta_diaria > 0 else None
-    total_periodo = float(daily_g["ganancia"].sum())
-    meta_str = (
-        f"  ·  días sobre meta ({fmt_cop(meta_diaria)}): **{n_meta}**"
-        if n_meta is not None
-        else ""
-    )
-    st.caption(
-        f"Días con ganancia: **{n_pos}**  ·  con pérdida: **{n_neg}**{meta_str}  "
-        f"·  acumulada del periodo: **{fmt_cop(total_periodo)}**."
-    )
-
-
-st.divider()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Tasa de conversión por día (ventas ÷ conversaciones, día de Bogotá)
-# ──────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Tasa de conversión por día")
-
-if daily.empty:
-    st.info("Sin datos diarios en el rango.")
-elif daily["conversaciones"].sum() == 0:
-    st.info("Sin conversaciones en el rango — no se puede calcular la tasa.")
-else:
-    st.caption(
-        "Tasa de conversión diaria = (nº ventas del día ÷ conversaciones del "
-        "día) × 100. Los días con 0 conversaciones se omiten de la línea."
-    )
-
-    daily_r = daily.copy()
-    # División segura: NaN cuando conversaciones = 0 (en vez de error / inf).
-    daily_r["tasa"] = np.where(
-        daily_r["conversaciones"] > 0,
-        100.0 * daily_r["n_ventas"] / daily_r["conversaciones"].replace(0, np.nan),
-        np.nan,
-    )
-
-    fig_rate = px.line(
-        daily_r,
-        x="date",
-        y="tasa",
-        markers=True,
-        labels={"date": "Día", "tasa": "Tasa de conversión (%)"},
-        color_discrete_sequence=["#00CC96"],
-    )
-    fig_rate.update_layout(
-        hovermode="x unified",
-        yaxis_tickformat=".1f",
-        yaxis_ticksuffix="%",
-    )
-    # Los NaN (días sin conversaciones) cortan la línea; con connectgaps=False
-    # se ven los huecos sin extrapolar.
-    fig_rate.update_traces(
-        connectgaps=False,
-        hovertemplate="%{y:.1f}%",
-    )
-    st.plotly_chart(fig_rate, use_container_width=True)
-
+            st.divider()
+            _render_extra_sections(
+                df_country,
+                daily_country,
+                key_suffix=pais.lower().replace(" ", "_"),
+            )
 
 st.divider()
 
