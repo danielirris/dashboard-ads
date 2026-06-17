@@ -214,6 +214,19 @@ def _account_ids() -> list[str]:
     return list(_account_metadata().keys())
 
 
+def clear_account_cache() -> None:
+    """Limpia el caché de descubrimiento de tokens y cuentas.
+
+    `_load_tokens` y `_account_metadata` usan `@lru_cache` (viven por todo el
+    proceso). El botón "Refrescar datos" del dashboard solo borra el caché de
+    Streamlit, no este. Llamar a esto fuerza a re-descubrir `/me/adaccounts`
+    en la próxima consulta — necesario cuando se agrega una cuenta nueva al
+    Business Manager sin reiniciar la app.
+    """
+    _load_tokens.cache_clear()
+    _account_metadata.cache_clear()
+
+
 def _extract_action_value(actions, action_type: str) -> float:
     """Suma los valores de un `action_type` concreto dentro del campo `actions`.
 

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import get_config, save_config  # noqa: E402
 from facebook_client import (  # noqa: E402
+    clear_account_cache,
     get_daily_spend_by_ad,
     sync_ads_to_supabase,
 )
@@ -462,6 +463,17 @@ st.sidebar.caption(f"Periodo: **{since}** → **{until}**")
 
 if st.sidebar.button("🔄 Refrescar datos"):
     st.cache_data.clear()
+    st.rerun()
+
+if st.sidebar.button(
+    "🔁 Refrescar cuentas",
+    help="Vuelve a descubrir las cuentas publicitarias en Facebook. Úsalo "
+    "cuando agregues una cuenta nueva al Business Manager y no aparezca "
+    "todavía (sin reiniciar la app).",
+):
+    clear_account_cache()
+    st.cache_data.clear()
+    st.sidebar.success("Cuentas re-descubiertas. Recargando…")
     st.rerun()
 
 if st.sidebar.button("📥 Sincronizar anuncios con Facebook"):
