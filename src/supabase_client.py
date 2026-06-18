@@ -88,7 +88,12 @@ def get_sales(since: str, until: str) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["ad_id", "valor", "moneda", "pais", "fecha_compra"])
     if not df.empty:
         df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-        df["fecha_compra"] = pd.to_datetime(df["fecha_compra"], utc=True)
+        # format="ISO8601": los timestamptz de Supabase traen fracciones de
+        # segundo de largo variable (.253, .13, .4). Sin esto, pandas infiere
+        # un único formato del primer valor y falla con los demás.
+        df["fecha_compra"] = pd.to_datetime(
+            df["fecha_compra"], utc=True, format="ISO8601"
+        )
 
         # Moneda NULL → asumir COP.
         monedas_null = df["moneda"].isna()
@@ -162,7 +167,10 @@ def get_contactos(since: str, until: str) -> pd.DataFrame:
         rows, columns=["primer_ad_id", "primer_contacto_at", "pais"]
     )
     if not df.empty:
-        df["primer_contacto_at"] = pd.to_datetime(df["primer_contacto_at"], utc=True)
+        # format="ISO8601": fracciones de segundo de largo variable (ver get_sales).
+        df["primer_contacto_at"] = pd.to_datetime(
+            df["primer_contacto_at"], utc=True, format="ISO8601"
+        )
     return df
 
 
